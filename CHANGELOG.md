@@ -5,7 +5,8 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
-First release. An independent Rust implementation of LNURLcash, checked against
+First release. A Rust implementation of LNURLcash, following the protocol layer
+of dni's [lnurl-wallet](https://github.com/dni/lnurl-wallet) and checked against
 the shared
 [conformance vectors](https://github.com/TheCryptoDonkey/lnurlcash-conformance)
 and the adversarial mock mint.
