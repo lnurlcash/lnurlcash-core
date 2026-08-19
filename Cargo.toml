@@ -1,0 +1,59 @@
+[package]
+name = "lnurlcash-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "LNURLcash (LUD-25) bearer notes - the money-critical logic, with bindings for other languages"
+license = "MIT"
+repository = "https://github.com/TheCryptoDonkey/lnurlcash-core"
+homepage = "https://github.com/TheCryptoDonkey/lnurlcash-core"
+documentation = "https://docs.rs/lnurlcash-core"
+readme = "README.md"
+keywords = ["lnurl", "lightning", "bitcoin", "lnurlcash", "bearer"]
+categories = ["cryptography::cryptocurrencies", "api-bindings"]
+exclude = ["/.github", "/tests"]
+
+[lib]
+name = "lnurlcash_core"
+# cdylib is what the UniFFI bindings load at runtime; rlib keeps the crate
+# usable as an ordinary Rust dependency
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+secp256k1 = { version = "0.29", features = ["recovery", "rand"] }
+sha2 = "0.10"
+hex = "0.4"
+bech32 = "0.9"
+url = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+thiserror = "1"
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+uniffi = { version = "0.28", optional = true }
+
+[features]
+default = []
+# UniFFI bindings for Kotlin and Swift. The exported surface is deliberately
+# the PURE half of this crate - request building, response parsing, signature
+# verification, fee arithmetic - so a mobile app keeps its own HTTP stack and
+# nothing async crosses the FFI boundary.
+ffi = ["dep:uniffi"]
+# the bindings generator itself. Separate from `ffi` so a mobile build does not
+# compile a CLI it will never run.
+bindgen = ["ffi", "uniffi/cli"]
+# an HTTP client over reqwest. Off by default: the core is pure, and a caller
+# with its own stack should not have to compile one it will not use.
+client = ["dep:reqwest"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process"] }
+serde_json = "1"
+hex = "0.4"
+# the mock mint fixtures talk to its test hooks directly
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

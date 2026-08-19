@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # the mock mint is a Node process from the conformance repo, and the
+      # vectors come from there too
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/checkout@v4
+        with:
+          repository: TheCryptoDonkey/lnurlcash-conformance
+          path: conformance
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo test --features client
+        env:
+          LNURLCASH_CONFORMANCE: ${{ github.workspace }}/conformance
+      - run: cargo build --features ffi
+      - run: cargo doc --no-deps --all-features
+
+  bindings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # the Kotlin wrapper is built on these, so a change that breaks
+      # generation must fail here rather than there
+      - run: cargo build --release --features ffi
+      - run: |
+          cargo run --features bindgen --bin uniffi-bindgen -- \
+            generate --library target/release/liblnurlcash_core.so \
+            --language kotlin --out-dir bindings/kotlin
+      - run: |
+          cargo run --features bindgen --bin uniffi-bindgen -- \
+            generate --library target/release/liblnurlcash_core.so \
+            --language swift --out-dir bindings/swift
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings
+          path: bindings/
