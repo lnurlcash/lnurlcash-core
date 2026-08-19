@@ -29,6 +29,10 @@ jobs:
           repository: TheCryptoDonkey/lnurlcash-conformance
           path: conformance
       - uses: Swatinem/rust-cache@v2
+      # the mock mint is a Node process with its own dependencies - without
+      # these the adversarial suite cannot start it
+      - run: npm ci
+        working-directory: conformance
       - run: cargo fmt --check
       - run: cargo clippy --all-features --all-targets -- -D warnings
       - run: cargo test --features client

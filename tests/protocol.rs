@@ -36,9 +36,20 @@ fn conformance_dir() -> PathBuf {
 }
 
 impl MockMint {
+    /// `None` only when the conformance repo is not checked out at all - the
+    /// single case a local run may legitimately skip. Everything else (no
+    /// node, dependencies not installed, the mint dying on startup) is a hard
+    /// failure. A silent skip there lets this entire suite pass while testing
+    /// nothing, reporting the same "24 passed" either way, which is precisely
+    /// how it once went green in CI against a mint that never started.
     fn start(flags: &[&str]) -> Option<Self> {
         let script = conformance_dir().join("mock-mint").join("index.mjs");
         if !script.exists() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no mock mint at {} - CI must run the adversarial suite, never skip it",
+                script.display()
+            );
             eprintln!("skipping: no mock mint at {}", script.display());
             return None;
         }
@@ -48,16 +59,20 @@ impl MockMint {
             .arg("--port=0")
             .arg("--testHooks=true")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            // inherited, not silenced: when the mint fails to boot its stderr
+            // is the only thing that says why
+            .stderr(Stdio::inherit());
         for flag in flags {
             command.arg(flag);
         }
-        let mut process = command.spawn().ok()?;
+        let mut process = command
+            .spawn()
+            .expect("the mock mint script is present, so node must be able to run it");
         let stdout = process.stdout.take().expect("piped stdout");
         let mut reader = BufReader::new(stdout);
         let (mut url, mut pubkey) = (None, None);
         let mut line = String::new();
-        while reader.read_line(&mut line).ok()? > 0 {
+        while reader.read_line(&mut line).expect("read the mint's stdout") > 0 {
             if let Some(rest) = line.split("listening on ").nth(1) {
                 url = Some(rest.trim().to_string());
             }
@@ -70,8 +85,8 @@ impl MockMint {
             line.clear();
         }
         Some(MockMint {
-            url: url?,
-            pubkey: pubkey?,
+            url: url.expect("the mint announced the address it is listening on"),
+            pubkey: pubkey.expect("the mint announced its pubkey"),
             process,
         })
     }
