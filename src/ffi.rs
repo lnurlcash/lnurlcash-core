@@ -137,6 +137,9 @@ pub struct FfiMintAddress {
     pub node_alias: Option<String>,
     pub node_uri: Option<String>,
     pub node_color: Option<String>,
+    pub node_capacity_msat: Option<u64>,
+    pub node_num_channels: Option<u64>,
+    pub node_num_peers: Option<u64>,
 }
 
 #[derive(Debug, uniffi::Record)]
@@ -408,6 +411,9 @@ pub fn parse_mint_address(body: &str) -> FfiResult<FfiMintAddress> {
         node_alias: info.node_alias,
         node_uri: info.node_uri,
         node_color: info.node_color,
+        node_capacity_msat: info.node_capacity_msat,
+        node_num_channels: info.node_num_channels,
+        node_num_peers: info.node_num_peers,
     })
 }
 

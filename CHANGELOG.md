@@ -13,6 +13,13 @@ and the adversarial mock mint.
 
 ### Design notes
 
+**The mint address carries the node stats under their wire names.** lnurl-mint
+advertises `nodeCapacity` in msat, so `node_capacity_msat` is a rename and has
+to be mapped rather than passed through — the TypeScript sibling shipped that
+rename unmapped and read `undefined` for every mint.
+
+
+
 **The core has no I/O.** `protocol` describes each operation as a `Request` — a
 URL, and the fresh secrets that must survive a lost answer — paired with a
 `parse_*` function. The `client` feature is a thin loop over exactly that, and

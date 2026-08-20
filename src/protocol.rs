@@ -55,6 +55,11 @@ pub struct MintAddressInfo {
     pub node_alias: Option<String>,
     pub node_uri: Option<String>,
     pub node_color: Option<String>,
+    /// The wire field is `nodeCapacity`, msat like every other amount here.
+    /// Suffixed on this side so a caller cannot read it as sats.
+    pub node_capacity_msat: Option<u64>,
+    pub node_num_channels: Option<u64>,
+    pub node_num_peers: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +205,9 @@ pub fn parse_mint_address(body: &Value) -> Result<MintAddressInfo> {
         node_alias: as_str(body, "nodeAlias"),
         node_uri: as_str(body, "nodeUri"),
         node_color: as_str(body, "nodeColor"),
+        node_capacity_msat: as_u64(body, "nodeCapacity"),
+        node_num_channels: as_u64(body, "nodeNumChannels"),
+        node_num_peers: as_u64(body, "nodeNumPeers"),
     })
 }
 

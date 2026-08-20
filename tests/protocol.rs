@@ -165,6 +165,23 @@ async fn reports_value_and_never_burns() {
 }
 
 #[tokio::test]
+async fn reads_the_node_stats_a_mint_address_advertises() {
+    let mint = mint_or_skip!(&[]);
+    let client = Client::new();
+
+    let info = client
+        .fetch_mint_address(&format!("{}/.well-known/lnurlw/mint", mint.url))
+        .await
+        .unwrap();
+    assert_eq!(info.node_alias.as_deref(), Some("mock-mint"));
+    // the wire field is nodeCapacity - renamed here, so it only arrives if
+    // it is mapped rather than passed through under its own name
+    assert_eq!(info.node_capacity_msat, Some(500_000_000));
+    assert_eq!(info.node_num_channels, Some(4));
+    assert_eq!(info.node_num_peers, Some(6));
+}
+
+#[tokio::test]
 async fn max_withdrawable_beats_the_urls_own_claim() {
     let mint = mint_or_skip!(&[]);
     let client = Client::new();
