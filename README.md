@@ -158,6 +158,9 @@ Both by dni, both MIT:
 [lnurl-mint](https://github.com/dni/lnurl-mint) (the service) and
 [lnurl-wallet](https://github.com/dni/lnurl-wallet) (the wallet).
 
+The wider ecosystem — wallets, mints, hardware and the sibling ports — is
+indexed in [awesome-lnurlcash](https://github.com/TheCryptoDonkey/awesome-lnurlcash).
+
 ## License
 
 MIT.
