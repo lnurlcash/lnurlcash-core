@@ -11,7 +11,7 @@ use crate::bolt11::decode_bolt11_amount_msat;
 use crate::errors::{classify_note_error, Error, Result};
 use crate::fees::{parse_mint_fee, MintFee};
 use crate::note::note_k1;
-use crate::secrets::hash_k1;
+use crate::secrets::{hash_k1, is_preimage};
 use crate::urls::is_allowed_service_url;
 
 /// One GET, and the secrets whose loss would destroy money.
@@ -68,10 +68,42 @@ pub struct PayRequestInfo {
     pub min_sendable: u64,
     pub max_sendable: u64,
     pub metadata: String,
+    /// LUD-25: present when paying this mints a bearer note. The raw LUD-17
+    /// withdraw endpoint the note will live at, in either the plain or the
+    /// `lnurlw://` spelling - the draft says "as described in LUD-17", and
+    /// LUD-17 describes both, so a WALLET accepts either unchanged.
     pub withdraw_link: Option<String>,
+    /// Rarely present here: a WALLET that pays the invoice recovers the
+    /// SERVICE's node id from the invoice's own signature, so the draft only
+    /// has a SERVICE publish this where there is no invoice to recover it
+    /// from. Nothing forbids including it anyway.
     pub mint_pubkey: Option<String>,
+    /// Absent means the SERVICE advertised no fee, which the draft says to
+    /// read as fee-free rather than as unknown.
     pub mint_fee: Option<MintFee>,
+    /// LUD-12's field, and the normative LUD-25 minting capability. A mint
+    /// MUST allow the 64 characters a hex-encoded SHA-256 commitment needs.
+    pub comment_allowed: Option<u64>,
+    /// Additive ForgeSworn extension: this SERVICE also accepts the same
+    /// commitment as an `h` parameter. Never a substitute for the mandatory
+    /// comment, and anything that is not exactly `true` reads as false.
+    pub mint_to_hash: bool,
 }
+
+impl PayRequestInfo {
+    /// Whether this SERVICE can mint a current-draft LUD-25 note.
+    ///
+    /// `mint_to_hash` alone cannot stand in for it: that extension is additive
+    /// and predates the comment spelling, and a SERVICE without the comment
+    /// capacity has nowhere to put the commitment.
+    pub fn names_mint_output(&self) -> bool {
+        self.comment_allowed
+            .is_some_and(|allowed| allowed >= MINT_COMMENT_LENGTH)
+    }
+}
+
+/// The exact comment capacity minting needs: 32 bytes as lowercase hex.
+pub const MINT_COMMENT_LENGTH: u64 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvoiceResult {
@@ -357,23 +389,119 @@ pub fn parse_pay_request(body: &Value) -> Result<PayRequestInfo> {
         return Err(invalid());
     }
     let metadata = as_str(body, "metadata").unwrap_or_default();
+    let withdraw_link = match body.get("withdrawLink") {
+        // A withdrawLink that is present but not a string is a broken mint,
+        // not a mint without one. Reading it as absent would send the caller
+        // down the well-known fallback and quietly mint against the wrong
+        // endpoint.
+        Some(value) if !value.is_string() => {
+            return Err(Error::Protocol(
+                "the mint's payRequest has an invalid withdrawLink".into(),
+            ))
+        }
+        _ => as_str(body, "withdrawLink"),
+    };
+    let comment_allowed = as_u64(body, "commentAllowed");
+    // LUD-25: minting is comment-bound. A payRequest that advertises a
+    // withdrawLink but no room for the 64-character commitment is offering
+    // something it cannot deliver, and the failure would otherwise land after
+    // the caller had already paid.
+    if withdraw_link.is_some()
+        && !comment_allowed.is_some_and(|allowed| allowed >= MINT_COMMENT_LENGTH)
+    {
+        return Err(Error::Protocol(
+            "this mint offers no room for the required output commitment - it cannot mint".into(),
+        ));
+    }
     Ok(PayRequestInfo {
         callback: as_str(body, "callback").ok_or_else(invalid)?,
         min_sendable: as_u64(body, "minSendable").unwrap_or(0),
         max_sendable: as_u64(body, "maxSendable").unwrap_or(0),
         mint_fee: parse_mint_fee(&metadata),
         metadata,
-        withdraw_link: as_str(body, "withdrawLink"),
+        withdraw_link,
         mint_pubkey: as_str(body, "mintPubkey"),
+        comment_allowed,
+        mint_to_hash: body.get("mintToHash").and_then(|v| v.as_bool()) == Some(true),
     })
 }
 
+/// A plain LUD-06 invoice request. Correct for paying an ordinary Lightning
+/// address; it mints nothing, because it names no output.
+///
+/// To mint, use [`mint_invoice_request`], which names the note before the
+/// invoice exists.
 pub fn invoice_request(pay_callback: &str, amount_msat: u64) -> Result<Request> {
     let mut url = url::Url::parse(pay_callback)
         .map_err(|_| Error::RequestRefused("that pay callback does not parse".into()))?;
     url.query_pairs_mut()
         .append_pair("amount", &amount_msat.to_string());
     Ok(Request::plain(url.to_string()))
+}
+
+/// Ask for a mint invoice, naming the note it will credit.
+///
+/// `h` is `sha256(secret)` for a secret only the WALLET holds. LUD-25 carries
+/// it as a mandatory LUD-12 `comment`; `h` repeats the identical value for
+/// SERVICEs that took the parameter form first, which is what the vectors'
+/// `mintToHash` profile pins. It is never an alternative to the comment.
+///
+/// The SERVICE learns a hash and nothing else, so the payment preimage is
+/// settlement proof only - it can never redeem the note. That is the whole
+/// point of the current draft: a preimage propagates to every routing node
+/// that forwards the payment, and a note keyed by one is a note they can all
+/// spend.
+pub fn mint_invoice_request_with_hash(
+    pay_callback: &str,
+    amount_msat: u64,
+    h: &str,
+) -> Result<Request> {
+    let h = h.trim().to_ascii_lowercase();
+    // Refused here rather than sent, so a WALLET never pays for a quote the
+    // SERVICE was always going to reject.
+    if !is_preimage(&h) {
+        return Err(Error::RequestRefused(
+            "an output commitment must be 32 bytes of hex - no invoice was requested".into(),
+        ));
+    }
+    let mut url = url::Url::parse(pay_callback)
+        .map_err(|_| Error::RequestRefused("that pay callback does not parse".into()))?;
+    {
+        let mut serializer = url.query_pairs_mut();
+        serializer.append_pair("amount", &amount_msat.to_string());
+        serializer.append_pair("comment", &h);
+        serializer.append_pair("h", &h);
+    }
+    Ok(Request::plain(url.to_string()))
+}
+
+/// [`mint_invoice_request_with_hash`], generating the commitment from the
+/// secret the caller will hold the note by.
+///
+/// The secret comes back on [`Request::new_secrets`]. **Persist it before
+/// paying the invoice this returns.** Paying for a note and then losing its
+/// secret is the one way the comment-bound scheme is worse than the preimage
+/// one it replaced, and persisting first removes it entirely. Drawing the
+/// secret from the seed derivation rather than the CSPRNG makes the note
+/// recoverable from birth, without any rotate at all.
+pub fn mint_invoice_request(
+    pay_callback: &str,
+    amount_msat: u64,
+    mint_secret: &str,
+) -> Result<Request> {
+    // Checked before hashing, so a malformed secret is RequestRefused - the
+    // caller's own input, nothing sent - rather than the Protocol error
+    // hash_k1 would raise, which in this crate's taxonomy accuses the SERVICE
+    // of a broken response it never sent.
+    if !is_preimage(mint_secret) {
+        return Err(Error::RequestRefused(
+            "a note secret must be 32 bytes of hex - no invoice was requested".into(),
+        ));
+    }
+    let mut request =
+        mint_invoice_request_with_hash(pay_callback, amount_msat, &hash_k1(mint_secret)?)?;
+    request.new_secrets = vec![mint_secret.to_string()];
+    Ok(request)
 }
 
 pub fn parse_invoice(body: &Value, requested_msat: u64) -> Result<InvoiceResult> {
@@ -397,10 +525,14 @@ pub fn parse_invoice(body: &Value, requested_msat: u64) -> Result<InvoiceResult>
     })
 }
 
-/// LUD-21. For LNURLcash specifically, a settled invoice's preimage IS the
-/// bearer note's spend secret, and a verify GET proves nothing about who is
-/// asking - only that they know the payment hash, which travels inside the
-/// invoice itself. A caller receiving a preimage here MUST rotate immediately.
+/// LUD-21, to learn whether a mint or melt has settled.
+///
+/// Under current LUD-25 this is unconditionally safe to call and its answer
+/// unconditionally safe to disclose: minting is comment-bound, so the preimage
+/// a settled invoice reveals is settlement proof and never the note's
+/// credential. (It was not always so. An earlier draft keyed the note by the
+/// payment preimage, which made this endpoint hand out the money; that
+/// fallback is gone.)
 pub fn verify_request(verify_url: &str) -> Result<Request> {
     Ok(Request::plain(verify_url.to_string()))
 }

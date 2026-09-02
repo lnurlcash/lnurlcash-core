@@ -157,6 +157,13 @@ pub struct FfiPayRequest {
     pub withdraw_link: Option<String>,
     pub mint_pubkey: Option<String>,
     pub mint_fee: Option<FfiMintFee>,
+    /// LUD-12's field, and LUD-25's minting capability: a mint must allow the
+    /// 64 characters the output commitment needs.
+    pub comment_allowed: Option<u64>,
+    /// Additive ForgeSworn extension, never a substitute for the comment.
+    pub mint_to_hash: bool,
+    /// Whether this SERVICE can mint a current-draft note at all.
+    pub names_mint_output: bool,
 }
 
 #[derive(Debug, uniffi::Record)]
@@ -169,7 +176,9 @@ pub struct FfiInvoice {
 #[derive(Debug, uniffi::Record)]
 pub struct FfiVerify {
     pub settled: bool,
-    /// For LNURLcash this preimage IS the bearer note's secret. Rotate at once.
+    /// Settlement proof, not the note. Current LUD-25 binds a note to a
+    /// wallet-chosen secret named in the mint comment, so a preimage here
+    /// redeems nothing.
     pub preimage: Option<String>,
     pub pr: String,
 }
@@ -344,9 +353,32 @@ pub fn pay_request_request(url: &str) -> FfiResult<FfiRequest> {
     Ok(protocol::pay_request_request(url)?.into())
 }
 
+/// A plain LUD-06 invoice request. Mints nothing - it names no output.
 #[uniffi::export]
 pub fn invoice_request(pay_callback: &str, amount_msat: u64) -> FfiResult<FfiRequest> {
     Ok(protocol::invoice_request(pay_callback, amount_msat)?.into())
+}
+
+/// Ask for a mint invoice, naming the note it will credit with
+/// `h = sha256(secret)`.
+#[uniffi::export]
+pub fn mint_invoice_request_with_hash(
+    pay_callback: &str,
+    amount_msat: u64,
+    h: &str,
+) -> FfiResult<FfiRequest> {
+    Ok(protocol::mint_invoice_request_with_hash(pay_callback, amount_msat, h)?.into())
+}
+
+/// The same, from the secret itself. It comes back on the request's
+/// `new_secrets`: persist it BEFORE paying the invoice.
+#[uniffi::export]
+pub fn mint_invoice_request(
+    pay_callback: &str,
+    amount_msat: u64,
+    mint_secret: &str,
+) -> FfiResult<FfiRequest> {
+    Ok(protocol::mint_invoice_request(pay_callback, amount_msat, mint_secret)?.into())
 }
 
 #[uniffi::export]
@@ -421,6 +453,8 @@ pub fn parse_mint_address(body: &str) -> FfiResult<FfiMintAddress> {
 pub fn parse_pay_request(body: &str) -> FfiResult<FfiPayRequest> {
     let value = parse_body(body)?;
     let info = protocol::parse_pay_request(&value)?;
+    // Computed before the struct literal moves `info` field by field.
+    let names_mint_output = info.names_mint_output();
     Ok(FfiPayRequest {
         callback: info.callback,
         min_sendable: info.min_sendable,
@@ -428,10 +462,13 @@ pub fn parse_pay_request(body: &str) -> FfiResult<FfiPayRequest> {
         metadata: info.metadata,
         withdraw_link: info.withdraw_link,
         mint_pubkey: info.mint_pubkey,
+        names_mint_output,
         mint_fee: info.mint_fee.map(|fee| FfiMintFee {
             base_fee_msat: fee.base_fee_msat,
             fee_ppm: fee.fee_ppm,
         }),
+        comment_allowed: info.comment_allowed,
+        mint_to_hash: info.mint_to_hash,
     })
 }
 

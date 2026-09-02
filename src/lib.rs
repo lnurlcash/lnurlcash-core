@@ -73,7 +73,7 @@ pub use note::{
 };
 pub use protocol::{
     InvoiceResult, MintAddressInfo, MutationResponse, PayRequestInfo, Request, VerifyResult,
-    WithdrawRequestInfo,
+    WithdrawRequestInfo, MINT_COMMENT_LENGTH,
 };
 pub use secrets::{generate_note_secret, hash_k1, is_preimage};
 pub use signature::{note_signature_digest, note_signature_message, verify_note_signature};

@@ -431,16 +431,26 @@ async fn a_failed_melt_restores_the_note() {
 // ---- minting ----
 
 #[tokio::test]
-async fn mints_a_note_from_a_paid_invoice_and_rotates_it() {
+async fn mints_a_note_the_service_never_saw_the_secret_of() {
     let mint = mint_or_skip!(&[]);
     let client = Client::new();
     let pay = client
         .fetch_pay_request(&format!("{}/.well-known/lnurlp/mint", mint.url))
         .await
         .unwrap();
-    let withdraw_link = pay.withdraw_link.expect("a minting payRequest");
+    // LUD-25 minting is comment-bound, so a mint MUST leave room for the
+    // 64-character commitment. Without it there is nowhere to name the note.
+    assert!(pay.names_mint_output());
+    assert_eq!(pay.comment_allowed, Some(64));
+    let withdraw_link = pay.withdraw_link.clone().expect("a minting payRequest");
 
-    let invoice = client.request_invoice(&pay.callback, 21000).await.unwrap();
+    // The wallet chooses the secret, before any invoice exists, and persists
+    // it before paying. The SERVICE is told sha256 of it and nothing more.
+    let mint_secret = secret(42);
+    let invoice = client
+        .request_mint_invoice(&pay.callback, 21000, &mint_secret)
+        .await
+        .unwrap();
     assert!(!invoice.disposable);
     let verify_url = invoice.verify.expect("LUD-21 verify");
     let payment_hash = verify_url.rsplit('/').next().unwrap().to_string();
@@ -451,21 +461,61 @@ async fn mints_a_note_from_a_paid_invoice_and_rotates_it() {
         .await
         .unwrap();
     assert!(verified.settled);
-    // the preimage IS the note secret - which the mint necessarily saw
-    let claimed = verified.preimage.expect("preimage disclosed");
-    assert_eq!(hash_k1(&claimed).unwrap(), payment_hash);
+    // The preimage is settlement proof and nothing else. Every node that
+    // forwarded the payment learned it; under the earlier draft that made all
+    // of them holders of the note. Here it redeems nothing.
+    let preimage = verified.preimage.expect("preimage disclosed");
+    assert_eq!(hash_k1(&preimage).unwrap(), payment_hash);
+    assert_ne!(preimage, mint_secret);
+    let preimage_url = build_note_url(&withdraw_link, &preimage, None).unwrap();
+    assert!(
+        client.fetch_note_info(&preimage_url).await.is_err(),
+        "the payment preimage must not redeem the note"
+    );
 
-    let note_url = build_note_url(&withdraw_link, &claimed, None).unwrap();
+    // The wallet's own secret is the note.
+    let note_url = build_note_url(&withdraw_link, &mint_secret, None).unwrap();
     let info = client.fetch_note_info(&note_url).await.unwrap();
     assert_eq!(info.max_withdrawable, 21000);
 
-    let rotated = client.rotate_note(&info.callback, &claimed).await.unwrap();
-    // after rotating, the secret the mint generated is worthless
-    assert_eq!(mint.note_state(&claimed).await.as_deref(), Some("burned"));
+    let rotated = client
+        .rotate_note(&info.callback, &mint_secret)
+        .await
+        .unwrap();
+    assert_eq!(
+        mint.note_state(&mint_secret).await.as_deref(),
+        Some("burned")
+    );
     assert_eq!(
         mint.note_state(&rotated.k1).await.as_deref(),
         Some("outstanding")
     );
+}
+
+#[tokio::test]
+async fn refuses_to_pay_for_a_note_it_cannot_name() {
+    let mint = mint_or_skip!(&[]);
+    let client = Client::new();
+    let pay = client
+        .fetch_pay_request(&format!("{}/.well-known/lnurlp/mint", mint.url))
+        .await
+        .unwrap();
+
+    // A malformed commitment is refused before the request leaves, so a
+    // WALLET never pays for a quote the SERVICE was always going to reject.
+    let err = client
+        .request_mint_invoice(&pay.callback, 21000, "not-a-32-byte-secret")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::RequestRefused(_)), "got {err:?}");
+
+    // And an unnamed mint quote is refused by the SERVICE itself, before any
+    // invoice exists to pay.
+    let err = client
+        .request_invoice(&pay.callback, 21000)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::ServiceRejected(_)), "got {err:?}");
 }
 
 #[tokio::test]

@@ -4,6 +4,10 @@
 
 use std::path::PathBuf;
 
+use lnurlcash_core::protocol::{
+    mint_invoice_request, mint_invoice_request_with_hash, parse_invoice, parse_pay_request,
+    parse_verify,
+};
 use lnurlcash_core::{
     apply_mint_fee, build_note_url, decode_bolt11_amount_msat, format_fee_percent,
     from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url, is_bolt11_invoice,
@@ -310,6 +314,152 @@ fn bolt11_vectors() {
             is_preimage(&value),
             case["expect"].as_bool().expect("expect"),
             "preimage shape of {value:?}"
+        );
+    }
+}
+
+/// LUD-25 minting, from pay-request.json.
+///
+/// This is the suite that would have caught the crate sitting on the deleted
+/// preimage-keyed model for a month: nothing here binds an opinion of its own,
+/// so a draft change lands as a red test rather than as a silent divergence
+/// discovered by a wallet that could not mint.
+#[test]
+fn pay_request_vectors() {
+    let vectors = load("pay-request.json");
+
+    for case in vectors["accepted"].as_array().expect("accepted") {
+        let name = str_of(case, "name");
+        let info = parse_pay_request(&case["body"])
+            .unwrap_or_else(|err| panic!("{name}: expected a parse, got {err}"));
+        assert_eq!(info.withdraw_link, opt_str(case, "withdrawLink"), "{name}");
+        assert_eq!(
+            info.comment_allowed,
+            case.get("commentAllowed").and_then(|v| v.as_u64()),
+            "{name}"
+        );
+        let expected_fee = case.get("mintFee").filter(|v| !v.is_null()).map(fee_of);
+        assert_eq!(info.mint_fee, expected_fee, "{name}");
+        // A payRequest is only a mint if it can carry the commitment, and a
+        // mint is only a mint if it advertises where the note will live.
+        assert_eq!(
+            info.names_mint_output(),
+            info.withdraw_link.is_some(),
+            "{name}: minting capability must track withdrawLink"
+        );
+    }
+
+    for case in vectors["rejected"].as_array().expect("rejected") {
+        let name = str_of(case, "name");
+        assert!(
+            parse_pay_request(&case["body"]).is_err(),
+            "{name}: must not parse"
+        );
+    }
+
+    // The mint callback names the note before the invoice exists.
+    let callback = "https://mint.example/p/cb";
+    for case in vectors["mintCallback"]["accepted"]
+        .as_array()
+        .expect("mintCallback.accepted")
+    {
+        let name = str_of(case, "name");
+        let comment = str_of(case, "comment");
+        let amount = case["amountMsat"].as_u64().expect("amountMsat");
+        let request = mint_invoice_request_with_hash(callback, amount, &comment)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        // LUD-25 carries the commitment as a mandatory LUD-12 comment; `h`
+        // repeats it for the additive ForgeSworn profile.
+        assert!(
+            request.url.contains(&format!("comment={comment}")),
+            "{name}: the commitment must ride as a comment - got {}",
+            request.url
+        );
+        assert!(request.url.contains(&format!("h={comment}")), "{name}");
+        assert!(request.url.contains(&format!("amount={amount}")), "{name}");
+        assert_eq!(
+            case["noteId"].as_str(),
+            Some(comment.as_str()),
+            "{name}: the note is keyed by the commitment"
+        );
+        assert_eq!(
+            case["paymentPreimageIsBearerK1"].as_bool(),
+            Some(false),
+            "{name}: the preimage is settlement proof, never the note"
+        );
+    }
+
+    for case in vectors["mintCallback"]["rejected"]
+        .as_array()
+        .expect("mintCallback.rejected")
+    {
+        let name = str_of(case, "name");
+        let amount = case["amountMsat"].as_u64().expect("amountMsat");
+        // A null comment is the unnamed mint the draft forbids: this crate
+        // cannot express one, because the minting builder requires the
+        // commitment. A malformed one is refused before anything is sent.
+        match case["comment"].as_str() {
+            None => assert!(
+                mint_invoice_request(callback, amount, "").is_err(),
+                "{name}: an unnamed mint must be impossible to build"
+            ),
+            Some(comment) => assert!(
+                mint_invoice_request_with_hash(callback, amount, comment).is_err(),
+                "{name}: a malformed commitment must be refused before it is sent"
+            ),
+        }
+    }
+
+    for case in vectors["invoice"]["accepted"]
+        .as_array()
+        .expect("invoice.accepted")
+    {
+        let name = str_of(case, "name");
+        let requested = case["requestedMsat"].as_u64().expect("requestedMsat");
+        let invoice =
+            parse_invoice(&case["body"], requested).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(
+            invoice.disposable,
+            case["disposable"].as_bool().expect("disposable"),
+            "{name}"
+        );
+        assert_eq!(invoice.verify, opt_str(case, "verify"), "{name}");
+    }
+
+    for case in vectors["invoice"]["rejected"]
+        .as_array()
+        .expect("invoice.rejected")
+    {
+        let name = str_of(case, "name");
+        let requested = case["requestedMsat"].as_u64().expect("requestedMsat");
+        assert!(
+            parse_invoice(&case["body"], requested).is_err(),
+            "{name}: must not parse"
+        );
+    }
+
+    for case in vectors["verify"]["accepted"]
+        .as_array()
+        .expect("verify.accepted")
+    {
+        let name = str_of(case, "name");
+        let verified = parse_verify(&case["body"]).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(
+            verified.settled,
+            case["settled"].as_bool().expect("settled"),
+            "{name}"
+        );
+        assert_eq!(verified.preimage, opt_str(case, "preimage"), "{name}");
+    }
+
+    for case in vectors["verify"]["rejected"]
+        .as_array()
+        .expect("verify.rejected")
+    {
+        let name = str_of(case, "name");
+        assert!(
+            parse_verify(&case["body"]).is_err(),
+            "{name}: must not parse"
         );
     }
 }

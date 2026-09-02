@@ -227,6 +227,7 @@ impl Client {
         protocol::parse_pay_request(&body)
     }
 
+    /// A plain LUD-06 invoice. Mints nothing: it names no output.
     pub async fn request_invoice(
         &self,
         pay_callback: &str,
@@ -234,6 +235,27 @@ impl Client {
     ) -> Result<protocol::InvoiceResult> {
         let body = self
             .run(protocol::invoice_request(pay_callback, amount_msat)?)
+            .await?;
+        protocol::parse_invoice(&body, amount_msat)
+    }
+
+    /// An invoice that mints a note the caller already holds the secret to.
+    ///
+    /// **Persist `mint_secret` before paying the invoice this returns.** The
+    /// SERVICE only ever learns its hash, so it cannot help reconstruct it,
+    /// and a paid invoice whose secret was lost is a note nobody can spend.
+    pub async fn request_mint_invoice(
+        &self,
+        pay_callback: &str,
+        amount_msat: u64,
+        mint_secret: &str,
+    ) -> Result<protocol::InvoiceResult> {
+        let body = self
+            .run(protocol::mint_invoice_request(
+                pay_callback,
+                amount_msat,
+                mint_secret,
+            )?)
             .await?;
         protocol::parse_invoice(&body, amount_msat)
     }
