@@ -5,6 +5,29 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Seed-recoverable note secrets, and the private lookup a restore needs
+
+- `cash`: LUD-25's `m/139'` scheme. `derive_cash_root`,
+  `derive_cash_domain_node`, `derive_cash_secret`, `cash_secret_at`,
+  `cash_domain_indices`, `cash_node_to_hex`/`from_hex`, `derive_cash_child`
+  and `CashSecretSource`. `d1..d4` are raw uint32 used exactly as they fall,
+  hardened only where they land at or above 2^31; masking the top bit or
+  hardening all four derives a different tree from every conforming wallet.
+- `secrets::derive_note_root` / `derive_note_secret`: the pre-spec HMAC
+  scheme, so notes minted under it stay findable. Not what to mint under.
+- `note::build_note_info_url_by_hash` and `protocol::parse_note_info_by_hash`,
+  with `Client::fetch_note_info_by_hash` behind the `client` feature: LUD-25's
+  `?h=` informational GET. A restore walk queries a whole gap window of
+  indices the wallet has not minted into yet, so asking by secret publishes
+  exactly the secrets it is about to mint under.
+- `NoteInfoByHash` is its own type rather than `WithdrawRequestInfo`: that
+  type's `k1` is the bearer secret, and a conforming SERVICE has nothing to
+  echo when the request never named one.
+- Graded against `lnurlcash-conformance` 0.7.0's `cash-derivation.json` and
+  `derivation.json`, including BIP-32's own published test vector 1.
+- New dependency: `hmac`. `secp256k1` was already here, so the unhardened
+  levels cost nothing extra.
+
 First release. A Rust implementation of LNURLcash, following the protocol layer
 of dni's [lnurl-wallet](https://github.com/dni/lnurl-wallet) and checked against
 the shared

@@ -80,6 +80,21 @@ impl Request {
     }
 }
 
+/// What a hash lookup returns. Deliberately NOT [`WithdrawRequestInfo`]: that
+/// type's `k1` is the bearer secret, and the whole point of asking by hash is
+/// that the caller already holds it and the SERVICE never sends it back. A
+/// conforming SERVICE omits `k1` here (LUD-03's convenience of echoing the
+/// queried value has nothing to echo), so a struct promising one would be
+/// promising something no answer contains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteInfoByHash {
+    pub callback: String,
+    pub max_withdrawable: u64,
+    pub min_withdrawable: u64,
+    pub default_description: Option<String>,
+    pub mint_pubkey: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithdrawRequestInfo {
     pub callback: String,
@@ -276,6 +291,49 @@ pub fn parse_note_info(
     Ok(WithdrawRequestInfo {
         callback,
         k1: k1.to_ascii_lowercase(),
+        max_withdrawable,
+        min_withdrawable,
+        default_description: as_str(body, "defaultDescription"),
+        mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
+    })
+}
+
+/// The same response, for a lookup that named the note by its hash.
+///
+/// Differs from [`parse_note_info`] in exactly two places, both because there
+/// was no secret in the request: `k1` is not required in the response, and
+/// there is no echo to check against. Everything else - the shape, and the
+/// mandatory `mintPubkey` - is enforced identically, because a note nobody can
+/// verify offline is no more acceptable when it was looked up privately.
+pub fn parse_note_info_by_hash(body: &Value, policy: Policy) -> Result<NoteInfoByHash> {
+    if let Err(Error::ServiceRejected(reason)) = reject_error(body) {
+        return Err(classify_note_error(&reason));
+    }
+    let invalid = || Error::Protocol("not a withdrawRequest (unexpected response)".into());
+    if body.get("tag").and_then(|v| v.as_str()) != Some("withdrawRequest") {
+        return Err(invalid());
+    }
+    let callback = as_str(body, "callback").ok_or_else(invalid)?;
+    let max_withdrawable = as_u64(body, "maxWithdrawable").ok_or_else(invalid)?;
+    let min_withdrawable = match body.get("minWithdrawable") {
+        None | Some(Value::Null) => 0,
+        Some(_) => as_u64(body, "minWithdrawable").ok_or_else(invalid)?,
+    };
+    if min_withdrawable > max_withdrawable {
+        return Err(invalid());
+    }
+    let mint_pubkey = as_str(body, "mintPubkey");
+    if policy.require_signatures && !mint_pubkey.as_deref().is_some_and(is_compressed_pubkey) {
+        return Err(Error::Protocol(
+            match mint_pubkey {
+                None => "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)",
+                Some(_) => "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key",
+            }
+            .into(),
+        ));
+    }
+    Ok(NoteInfoByHash {
+        callback,
         max_withdrawable,
         min_withdrawable,
         default_description: as_str(body, "defaultDescription"),

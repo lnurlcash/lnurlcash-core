@@ -79,6 +79,37 @@ pub fn build_note_url(withdraw_link: &str, k1: &str, amount_msat: Option<u64>) -
     Some(rebuild(&url, pairs))
 }
 
+/// The informational GET for a note named by its HASH rather than its secret.
+///
+/// LUD-25's "Checking a note without exposing it": a SERVICE MAY accept
+/// `?h=<hex sha256 of k1>` in place of `?k1=`, on the informational GET only
+/// and never at the callback. It already stores every note under that hash, so
+/// this is a second way into a lookup it can do anyway - and the secret stays
+/// off the wire, which is what a restore walk needs, since a walk queries a
+/// whole gap window of indices the wallet has not minted into yet.
+///
+/// `k1`, `amount` and `sig` are dropped: naming the note twice, once in a form
+/// that spends it, would defeat the point.
+///
+/// A SERVICE that does not index by hash answers exactly as it answers for an
+/// unknown `k1`, which LUD-25 requires, so a rejection here never distinguishes
+/// "not supported" from "no such note" - and a burned note is deliberately
+/// indistinguishable from one that never existed.
+pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<String> {
+    let hex = h.trim().to_ascii_lowercase();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let url = Url::parse(&from_lud17(withdraw_link.trim())).ok()?;
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != "k1" && k != "amount" && k != "sig")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pairs.push(("h".into(), hex));
+    Some(rebuild(&url, pairs))
+}
+
 /// The same note with its secret swapped out, after a rotate, split or merge.
 ///
 /// A signature only carries over when the response actually returned a fresh

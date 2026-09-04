@@ -4,10 +4,16 @@
 
 use std::path::PathBuf;
 
+use lnurlcash_core::cash::{
+    cash_domain_indices, cash_node_from_hex, cash_node_to_hex, cash_secret_at, derive_cash_child,
+    derive_cash_domain_node, derive_cash_root, derive_cash_secret,
+};
+use lnurlcash_core::hash_k1;
 use lnurlcash_core::protocol::{
     mint_invoice_request, mint_invoice_request_with_hash, parse_invoice, parse_pay_request,
     parse_verify,
 };
+use lnurlcash_core::secrets::{derive_note_root, derive_note_secret};
 use lnurlcash_core::{
     apply_mint_fee, build_note_url, decode_bolt11_amount_msat, format_fee_percent,
     from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url, is_bolt11_invoice,
@@ -460,6 +466,123 @@ fn pay_request_vectors() {
         assert!(
             parse_verify(&case["body"]).is_err(),
             "{name}: must not parse"
+        );
+    }
+}
+
+// ---- derivation ----
+//
+// The two schemes a wallet may mint under. `cash-derivation.json` is the one
+// LUD-25 specifies and the one a new wallet uses; `derivation.json` is the
+// pre-spec HMAC scheme, kept because notes minted under it are still money.
+//
+// A disagreement with either file is a wallet that cannot restore what
+// another implementation of the same seed phrase minted, which is the whole
+// reason these vectors exist rather than each library testing itself.
+
+#[test]
+fn cash_derivation_vectors() {
+    let vectors = load("cash-derivation.json");
+
+    assert_eq!(
+        vectors["scheme"]["purpose"].as_str(),
+        Some("m/139'"),
+        "the vector must describe the scheme this crate implements"
+    );
+    // The one thing an implementation can silently get wrong: d1..d4 are raw
+    // uint32, hardened only where they happen to land at or above 2^31.
+    assert_eq!(
+        vectors["scheme"]["hardenedByMagnitudeOnly"].as_bool(),
+        Some(true)
+    );
+
+    // BIP-32's own published vector 1, so a failure here says CKDpriv is
+    // wrong rather than the LUD-25 path above it. The chain alternates
+    // hardened and unhardened, which is exactly the pair of legs the domain
+    // levels land on.
+    let steps = vectors["bip32Vector1"]
+        .as_array()
+        .expect("bip32Vector1 is an array");
+    let mut node =
+        cash_node_from_hex(str_of(&steps[0], "node").as_str()).expect("vector 1 master parses");
+    for step in &steps[1..] {
+        let index = step["index"].as_u64().expect("index") as u32;
+        node = derive_cash_child(&node, index).expect("BIP-32 vector 1 derives");
+        assert_eq!(cash_node_to_hex(&node), str_of(step, "node"), "at {index}");
+    }
+
+    for case in vectors["cases"].as_array().expect("cases") {
+        let name = str_of(case, "name");
+        let host = str_of(case, "host");
+        let index = case["index"].as_u64().expect("index") as u32;
+        let seed = hex::decode(str_of(case, "seedHex")).expect("seedHex is hex");
+
+        let root = derive_cash_root(&seed).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(cash_node_to_hex(&root), str_of(case, "cashRoot"), "{name}");
+
+        let indices: Vec<u32> = case["domainIndices"]
+            .as_array()
+            .expect("domainIndices")
+            .iter()
+            .map(|value| value.as_u64().expect("index") as u32)
+            .collect();
+        assert_eq!(
+            cash_domain_indices(&root, &host).expect("indices").to_vec(),
+            indices,
+            "{name}"
+        );
+
+        let domain_node = derive_cash_domain_node(&root, &host).expect("domain node");
+        assert_eq!(
+            cash_node_to_hex(&domain_node),
+            str_of(case, "domainNode"),
+            "{name}"
+        );
+
+        let k1 = str_of(case, "k1");
+        assert_eq!(
+            derive_cash_secret(&root, &host, index).expect("secret"),
+            k1,
+            "{name}"
+        );
+        // The hardware-signer path: given only this mint's subtree, with no
+        // seed and no elliptic curve, every note index still resolves.
+        assert_eq!(
+            cash_secret_at(&domain_node, index).expect("secret"),
+            k1,
+            "{name}: from the domain node alone"
+        );
+        assert_eq!(
+            hash_k1(&k1).expect("hash"),
+            str_of(case, "noteId"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn legacy_derivation_vectors() {
+    let vectors = load("derivation.json");
+
+    assert_eq!(
+        vectors["scheme"]["rootKey"].as_str(),
+        Some("lnurlcash-note-v1")
+    );
+
+    for case in vectors["cases"].as_array().expect("cases") {
+        let name = str_of(case, "name");
+        let seed = hex::decode(str_of(case, "seedHex")).expect("seedHex is hex");
+        let root = derive_note_root(&seed);
+        let k1 = derive_note_secret(
+            &root,
+            &str_of(case, "host"),
+            case["index"].as_u64().unwrap() as u32,
+        );
+        assert_eq!(k1, str_of(case, "k1"), "{name}");
+        assert_eq!(
+            hash_k1(&k1).expect("hash"),
+            str_of(case, "noteId"),
+            "{name}"
         );
     }
 }

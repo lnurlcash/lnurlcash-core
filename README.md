@@ -152,6 +152,38 @@ about 2.1e21. It is computed split. A naive version passes every small test.
 99.9999% fee — roughly a million steps — so any guard on it returns a
 non-minimal answer, and the *service* picks the fee.
 
+## Seed-recoverable note secrets
+
+LUD-25 specifies them, and this crate implements the specified scheme:
+
+```
+cashHashingKey   = m/139'/0
+(d1, d2, d3, d4) = HMAC-SHA256(cashHashingKey, host)[0..16] as 4 uint32
+k1_i             = m/139'/d1/d2/d3/d4/i'
+```
+
+`d1..d4` are used **exactly as they fall**. BIP-32 reads any index `>= 2^31`
+as hardened, so which of the four levels are hardened is decided by the mint's
+own host name. Masking the top bit, or hardening all four, derives a different
+tree and restores nothing, silently. Only `i` is always hardened.
+
+`derive_cash_domain_node` is its own step for a reason: every unhardened level
+sits at or above it, so a hardware signer provisioned with that node rather
+than the seed needs **no elliptic curve at all**. The cost is that whoever
+derives it can derive every note secret held at that mint — provisioning
+material, one mint's subtree, not the wallet.
+
+`secrets::derive_note_root` / `derive_note_secret` are the pre-spec HMAC
+scheme this project shipped before the draft had one. Not deprecated, because
+notes minted under it are still money; just not what to mint under.
+
+**The counter is half the backup.** A SERVICE must answer a hash lookup for a
+burned note exactly as it answers one for a note it never issued, and a rotate
+burns the index below, so a wallet that has rotated more than its gap limit
+cannot find its own position by scanning. The per-host counter is not secret —
+an index reveals nothing without the root — so back it up, and merge it
+upwards only.
+
 ## Amounts
 
 Integers in milli-satoshis, everywhere, with no exceptions.

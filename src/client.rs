@@ -217,6 +217,28 @@ impl Client {
         protocol::parse_note_info(&body, url, self.config.policy)
     }
 
+    /// The informational GET for a note named by its hash, so nothing
+    /// spendable goes on the wire (LUD-25, "Checking a note without exposing
+    /// it"). What a restore walk uses: it queries a whole gap window of
+    /// indices the wallet has not minted into yet, and asking by secret would
+    /// publish exactly the secrets it is about to mint under.
+    ///
+    /// A rejection means nothing on its own. A SERVICE that does not index by
+    /// hash must answer as it would for an unknown `k1`, and so must one
+    /// answering for a note that was burned, so only a positive answer is
+    /// evidence of anything.
+    pub async fn fetch_note_info_by_hash(
+        &self,
+        withdraw_link: &str,
+        h: &str,
+    ) -> Result<protocol::NoteInfoByHash> {
+        let url = crate::note::build_note_info_url_by_hash(withdraw_link, h).ok_or_else(|| {
+            Error::RequestRefused("a note hash lookup needs a URL and 32 bytes of hex".into())
+        })?;
+        let body = self.run(protocol::note_info_request(&url)?).await?;
+        protocol::parse_note_info_by_hash(&body, self.config.policy)
+    }
+
     pub async fn fetch_mint_address(&self, url: &str) -> Result<protocol::MintAddressInfo> {
         let body = self.run(protocol::mint_address_request(url)?).await?;
         protocol::parse_mint_address(&body)
