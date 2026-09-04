@@ -45,7 +45,7 @@ use lnurlcash_core::{protocol, verify_note_signature};
 // no HTTP in the core: build, GET it yourself, parse
 let request = protocol::note_info_request(note_url)?;
 let body: serde_json::Value = your_http_get(&request.url)?;
-let info = protocol::parse_note_info(&body, note_url)?;
+let info = protocol::parse_note_info(&body, note_url, protocol::Policy::default())?;
 
 println!("{} msat", info.max_withdrawable);
 ```
@@ -90,6 +90,22 @@ match client.rotate_note(&callback, &k1).await {
 `Error::RequestRefused` is the opposite and safe: nothing left the process.
 `Error::is_ambiguous()` and `Error::is_definitive()` are the two questions
 worth asking about any failure here.
+
+A mutation whose answer the transport lost is re-sent rather than given up on.
+LUD-25 requires a service to answer a byte-identical rotate, split or merge
+with the success it already returned, so the retry usually completes the
+operation and the caller never sees an error at all
+(`ClientConfig::mutation_retries`, default 1). Never a melt, which carries
+`pr`, is paid asynchronously and has no replay guarantee; and never a
+definitive refusal, which is the service's considered answer.
+
+**2b. Offline verification is mandatory.** A service MUST publish `mintPubkey`
+and MUST sign every note a rotate, split or merge mints. `parse_note_info`
+refuses a `withdrawRequest` without a valid one, and a confirmed-but-unsigned
+mutation raises `Error::Unverifiable` — which **carries the fresh secrets**,
+because the mutation landed and the note is real. Set
+`Policy { require_signatures: false }` for a service that predates the
+requirement.
 
 **3. A melt's `OK` means "in flight", not "spent".** The service pays
 asynchronously and only burns the note once the payment settles, restoring it

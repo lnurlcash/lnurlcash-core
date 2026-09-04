@@ -14,6 +14,53 @@ use crate::note::note_k1;
 use crate::secrets::{hash_k1, is_preimage};
 use crate::urls::is_allowed_service_url;
 
+/// What this crate insists a SERVICE does, rather than merely hopes it does.
+///
+/// LUD-25 makes offline verification mandatory: a SERVICE MUST publish
+/// `mintPubkey` and MUST sign every note a rotate, split or merge mints. A
+/// wallet that quietly accepted unsigned notes would be handing its holder
+/// something nobody downstream can check, which is the exact gap offline
+/// verification exists to close - so the default insists.
+///
+/// Turn `require_signatures` off only to talk to a SERVICE that predates the
+/// requirement, and only knowing the cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Policy {
+    pub require_signatures: bool,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Policy {
+            require_signatures: true,
+        }
+    }
+}
+
+/// Which mutation a response is being read as, which decides what it must
+/// carry. A melt mints nothing, so it has no signature to return and none is
+/// required; a split mints two notes and owes a signature over each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationKind {
+    Melt,
+    Rotate,
+    Split,
+    Merge,
+}
+
+/// A compressed secp256k1 point: 33 bytes hex, the leading byte naming which
+/// of the two y values the x coordinate stands for.
+///
+/// Checked at the response rather than at the first signature check, because a
+/// `mintPubkey` that is not one verifies nothing - and the same fault found
+/// later looks like a forged note instead of a broken mint.
+pub fn is_compressed_pubkey(value: &str) -> bool {
+    let key = value.trim().to_ascii_lowercase();
+    key.len() == 66
+        && (key.starts_with("02") || key.starts_with("03"))
+        && key.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// One GET, and the secrets whose loss would destroy money.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -40,6 +87,9 @@ pub struct WithdrawRequestInfo {
     pub max_withdrawable: u64,
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
+    /// LUD-25 makes offline verification mandatory, so a conforming SERVICE
+    /// always publishes the key its notes verify against here. Only ever
+    /// `None` when the caller set [`Policy::require_signatures`] to false.
     pub mint_pubkey: Option<String>,
 }
 
@@ -177,7 +227,11 @@ pub fn note_info_request(url: &str) -> Result<Request> {
     Ok(Request::plain(parsed.to_string()))
 }
 
-pub fn parse_note_info(body: &Value, queried_url: &str) -> Result<WithdrawRequestInfo> {
+pub fn parse_note_info(
+    body: &Value,
+    queried_url: &str,
+    policy: Policy,
+) -> Result<WithdrawRequestInfo> {
     if let Err(Error::ServiceRejected(reason)) = reject_error(body) {
         return Err(classify_note_error(&reason));
     }
@@ -206,13 +260,26 @@ pub fn parse_note_info(body: &Value, queried_url: &str) -> Result<WithdrawReques
             ));
         }
     }
+    let mint_pubkey = as_str(body, "mintPubkey");
+    // Separate from the shape check above, and separately worded: this response
+    // IS a withdrawRequest, it just describes a note nobody can check offline.
+    // Saying "not a withdrawRequest" would send a caller after the wrong fault.
+    if policy.require_signatures && !mint_pubkey.as_deref().is_some_and(is_compressed_pubkey) {
+        return Err(Error::Protocol(
+            match mint_pubkey {
+                None => "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)",
+                Some(_) => "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key",
+            }
+            .into(),
+        ));
+    }
     Ok(WithdrawRequestInfo {
         callback,
         k1: k1.to_ascii_lowercase(),
         max_withdrawable,
         min_withdrawable,
         default_description: as_str(body, "defaultDescription"),
-        mint_pubkey: as_str(body, "mintPubkey"),
+        mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
     })
 }
 
@@ -359,7 +426,11 @@ pub fn merge_request(callback: &str, k1s: &[String], new_secret: &str) -> Result
 ///
 /// A 200 that does not confirm is [`Error::Ambiguous`], not a failure: the
 /// SERVICE may have applied the mutation and merely failed to say so.
-pub fn parse_mutation(body: &Value) -> Result<MutationResponse> {
+pub fn parse_mutation(
+    body: &Value,
+    kind: MutationKind,
+    policy: Policy,
+) -> Result<MutationResponse> {
     if let Err(Error::ServiceRejected(reason)) = reject_error(body) {
         return Err(classify_note_error(&reason));
     }
@@ -368,9 +439,32 @@ pub fn parse_mutation(body: &Value) -> Result<MutationResponse> {
             "the service did not confirm the operation - it may still have been applied",
         ));
     }
+    let signature = as_str(body, "sig").filter(|s| !s.is_empty());
+    let change_signature = as_str(body, "sig2").filter(|s| !s.is_empty());
+    // Every mutation the replay rule covers owes a signature over each note it
+    // mints. The mutation has already landed by the time this is checked -
+    // `status` was OK - so the caller of this function must attach the fresh
+    // secrets to the error, or enforcing the spec becomes the thing that loses
+    // the money. See `Error::with_secrets`.
+    if policy.require_signatures {
+        let missing = match kind {
+            MutationKind::Melt => None,
+            MutationKind::Split if signature.is_none() => Some("split"),
+            MutationKind::Split if change_signature.is_none() => Some("split's change"),
+            MutationKind::Split => None,
+            MutationKind::Rotate if signature.is_none() => Some("rotate"),
+            MutationKind::Merge if signature.is_none() => Some("merge"),
+            _ => None,
+        };
+        if let Some(what) = missing {
+            return Err(Error::unverifiable(format!(
+                "the service confirmed the {what} but returned no signature, so the note it just minted cannot be verified offline. The note exists - keep the secret"
+            )));
+        }
+    }
     Ok(MutationResponse {
-        signature: as_str(body, "sig"),
-        change_signature: as_str(body, "sig2"),
+        signature,
+        change_signature,
         pr: as_str(body, "pr"),
         verify: as_str(body, "verify"),
     })

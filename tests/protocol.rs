@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 use lnurlcash_core::client::{Client, ClientConfig, NoteFate};
+use lnurlcash_core::protocol::Policy;
 use lnurlcash_core::{build_note_url, hash_k1, verify_note_signature, Error};
 
 struct MockMint {
@@ -218,14 +219,14 @@ async fn unknown_and_spent_are_different_answers() {
         .fetch_note_info(&mint.note_url(&secret(5)))
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::NoteUnknown(_)), "got {err:?}");
+    assert!(matches!(err, Error::NoteUnknown { .. }), "got {err:?}");
 
     client.rotate_note(&mint.callback(), &known).await.unwrap();
     let err = client
         .fetch_note_info(&mint.note_url(&known))
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::NoteSpent(_)), "got {err:?}");
+    assert!(matches!(err, Error::NoteSpent { .. }), "got {err:?}");
 }
 
 // ---- rotate, split, merge ----
@@ -531,12 +532,127 @@ async fn reads_an_advertised_fee() {
     assert_eq!(fee.fee_ppm, 2000);
 }
 
+// ---- mandatory offline verification ----
+
+/// LUD-25 stopped treating a note signature as optional, so a SERVICE that
+/// issues none is non-conforming rather than merely basic. The refusal has to
+/// be the loud kind - but the rotate LANDED, and the fresh secret is the only
+/// key to the note it minted, so the error carries it out. Refusing without it
+/// would be this crate destroying real money to make a point about
+/// conformance.
+#[tokio::test]
+async fn an_unsigned_rotate_is_refused_without_losing_the_note() {
+    let mint = mint_or_skip!(&["--signatures=false"]);
+    let client = Client::new();
+    let k1 = secret(28);
+    mint.credit(&k1, 21000).await;
+
+    let err = client.rotate_note(&mint.callback(), &k1).await.unwrap_err();
+    assert!(
+        matches!(err, lnurlcash_core::errors::Error::Unverifiable { .. }),
+        "got {err:?}"
+    );
+    let kept = err.new_secrets().to_vec();
+    assert_eq!(kept.len(), 1);
+    // the note the caller was refused is real, outstanding, and reachable with
+    // nothing but the secret the error handed back
+    assert_eq!(
+        mint.note_state(&kept[0]).await.as_deref(),
+        Some("outstanding")
+    );
+}
+
+/// The same mint, for a caller who has decided to deal with it anyway. One
+/// setting, and the note comes back unsigned - which is what it is.
+#[tokio::test]
+async fn an_unsigned_service_still_works_when_the_caller_opts_out() {
+    let mint = mint_or_skip!(&["--signatures=false"]);
+    let client = Client::with_config(ClientConfig {
+        policy: Policy {
+            require_signatures: false,
+        },
+        ..ClientConfig::default()
+    });
+    let k1 = secret(29);
+    mint.credit(&k1, 21000).await;
+
+    let info = client.fetch_note_info(&mint.note_url(&k1)).await.unwrap();
+    let rotated = client.rotate_note(&info.callback, &k1).await.unwrap();
+    assert!(rotated.signature.is_none());
+    assert_eq!(
+        mint.note_state(&rotated.k1).await.as_deref(),
+        Some("outstanding")
+    );
+}
+
+// ---- a mutation the transport retried ----
+
+/// The old sharpest edge in the protocol, now closed. A SERVICE that has
+/// implemented the replay rule answers the second, byte-identical attempt with
+/// the success it already gave, so an unstoppable transport retry is invisible.
+/// One that has not still answers "already spent" - and then the crate does
+/// what it always did, and hands the secrets back rather than a verdict.
+#[tokio::test]
+async fn a_mint_that_will_not_replay_still_hands_the_secrets_back() {
+    let mint = mint_or_skip!(&["--dropAfterMutation=true", "--retriedMutation=refuse"]);
+    let client = Client::new();
+    let k1 = secret(30);
+    mint.credit(&k1, 21000).await;
+
+    let err = client.rotate_note(&mint.callback(), &k1).await.unwrap_err();
+    let rescued = err.new_secrets().to_vec();
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(
+        mint.note_state(&rescued[0]).await.as_deref(),
+        Some("outstanding")
+    );
+}
+
 // ---- ambiguous outcomes ----
 
+/// A client that gives up on the first ambiguous answer, as every client did
+/// before LUD-25 required a SERVICE to replay a retried mutation. The tests
+/// that assert what an unresolved mutation carries need it: with retries on,
+/// a conforming mint simply answers again and there is nothing left to carry.
+fn no_retry_client() -> Client {
+    Client::with_config(ClientConfig {
+        mutation_retries: 0,
+        ..ClientConfig::default()
+    })
+}
+
+/// The mutation landed and the answer was lost on the way back. LUD-25 now
+/// requires the SERVICE to answer the identical request with the success it
+/// already gave, so asking a second time turns this from an unresolved maybe
+/// into a completed rotate - the caller never sees an error at all.
+#[tokio::test]
+async fn a_lost_rotate_completes_by_asking_again() {
+    let mint = mint_or_skip!(&["--dropAfterMutation=true"]);
+    let client = Client::new();
+    let k1 = secret(27);
+    mint.credit(&k1, 21000).await;
+
+    let rotated = client.rotate_note(&mint.callback(), &k1).await.unwrap();
+    assert_eq!(mint.note_state(&k1).await.as_deref(), Some("burned"));
+    // the replay repeats the signature, so a note recovered this way is as
+    // verifiable as one whose first answer arrived
+    assert!(rotated.signature.is_some());
+    assert_eq!(
+        client
+            .fetch_note_info(&mint.note_url(&rotated.k1))
+            .await
+            .unwrap()
+            .max_withdrawable,
+        21000
+    );
+}
+
+/// The same mint, for a client that will not ask again: this is the shape the
+/// ambiguous machinery has always had, and it still has to work.
 #[tokio::test]
 async fn a_lost_rotate_preserves_its_fresh_secret() {
     let mint = mint_or_skip!(&["--dropAfterMutation=true"]);
-    let client = Client::new();
+    let client = no_retry_client();
     let k1 = secret(17);
     mint.credit(&k1, 21000).await;
 
@@ -561,7 +677,7 @@ async fn a_lost_rotate_preserves_its_fresh_secret() {
 #[tokio::test]
 async fn a_lost_split_preserves_both_secrets_in_output_order() {
     let mint = mint_or_skip!(&["--dropAfterMutation=true"]);
-    let client = Client::new();
+    let client = no_retry_client();
     let k1 = secret(18);
     mint.credit(&k1, 21000).await;
 
@@ -622,7 +738,7 @@ async fn probing_resolves_the_ambiguity() {
 #[tokio::test]
 async fn a_200_that_confirms_nothing_is_ambiguous() {
     let mint = mint_or_skip!(&["--unconfirmedMutation=true"]);
-    let client = Client::new();
+    let client = no_retry_client();
     let k1 = secret(21);
     mint.credit(&k1, 21000).await;
 

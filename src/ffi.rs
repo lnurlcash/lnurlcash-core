@@ -54,11 +54,26 @@ pub enum LnurlcashError {
     /// A melt is in flight on this k1. Retry - never read this as spent.
     NotePending,
     /// Authoritative: the note is already burned.
-    NoteSpent { reason: String },
+    NoteSpent {
+        reason: String,
+        new_secrets: Vec<String>,
+    },
     /// The service does not recognise this note.
-    NoteUnknown { reason: String },
+    NoteUnknown {
+        reason: String,
+        new_secrets: Vec<String>,
+    },
     /// The outcome is UNKNOWN. Preserve any secrets the request carried.
     Ambiguous {
+        detail: String,
+        new_secrets: Vec<String>,
+    },
+
+    /// The mutation LANDED and the SERVICE returned no signature over it.
+    /// LUD-25 requires one, so this is a non-conforming SERVICE - but the note
+    /// exists at the hash the wallet disclosed, and `new_secrets` is the only
+    /// key to it. Persist them before deciding anything else.
+    Unverifiable {
         detail: String,
         new_secrets: Vec<String>,
     },
@@ -71,10 +86,11 @@ impl std::fmt::Display for LnurlcashError {
                 write!(f, "{detail}")
             }
             LnurlcashError::ServiceRejected { reason }
-            | LnurlcashError::NoteSpent { reason }
-            | LnurlcashError::NoteUnknown { reason } => write!(f, "{reason}"),
+            | LnurlcashError::NoteSpent { reason, .. }
+            | LnurlcashError::NoteUnknown { reason, .. } => write!(f, "{reason}"),
             LnurlcashError::NotePending => write!(f, "pending"),
-            LnurlcashError::Ambiguous { detail, .. } => write!(f, "{detail}"),
+            LnurlcashError::Ambiguous { detail, .. }
+            | LnurlcashError::Unverifiable { detail, .. } => write!(f, "{detail}"),
         }
     }
 }
@@ -88,12 +104,31 @@ impl From<Error> for LnurlcashError {
             Error::Protocol(detail) => LnurlcashError::Protocol { detail },
             Error::ServiceRejected(reason) => LnurlcashError::ServiceRejected { reason },
             Error::NotePending => LnurlcashError::NotePending,
-            Error::NoteSpent(reason) => LnurlcashError::NoteSpent { reason },
-            Error::NoteUnknown(reason) => LnurlcashError::NoteUnknown { reason },
+            Error::NoteSpent {
+                reason,
+                new_secrets,
+            } => LnurlcashError::NoteSpent {
+                reason,
+                new_secrets,
+            },
+            Error::NoteUnknown {
+                reason,
+                new_secrets,
+            } => LnurlcashError::NoteUnknown {
+                reason,
+                new_secrets,
+            },
             Error::Ambiguous {
                 message,
                 new_secrets,
             } => LnurlcashError::Ambiguous {
+                detail: message,
+                new_secrets,
+            },
+            Error::Unverifiable {
+                message,
+                new_secrets,
+            } => LnurlcashError::Unverifiable {
                 detail: message,
                 new_secrets,
             },
@@ -181,6 +216,27 @@ pub struct FfiVerify {
     /// redeems nothing.
     pub preimage: Option<String>,
     pub pr: String,
+}
+
+/// Which mutation a response is being read as. A melt mints nothing and so
+/// owes no signature; a split mints two notes and owes one over each.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiMutationKind {
+    Melt,
+    Rotate,
+    Split,
+    Merge,
+}
+
+impl From<FfiMutationKind> for protocol::MutationKind {
+    fn from(kind: FfiMutationKind) -> Self {
+        match kind {
+            FfiMutationKind::Melt => protocol::MutationKind::Melt,
+            FfiMutationKind::Rotate => protocol::MutationKind::Rotate,
+            FfiMutationKind::Split => protocol::MutationKind::Split,
+            FfiMutationKind::Merge => protocol::MutationKind::Merge,
+        }
+    }
 }
 
 #[derive(Debug, uniffi::Record)]
@@ -416,10 +472,19 @@ pub fn merge_request(callback: &str, k1s: Vec<String>, new_secret: &str) -> FfiR
 
 // ---- response parsing ----
 
+/// `require_signatures` mirrors [`protocol::Policy`]: leave it true unless the
+/// SERVICE predates LUD-25's mandatory offline verification, because a note
+/// with no key to check it against is one whoever receives it must take on
+/// faith.
 #[uniffi::export]
-pub fn parse_note_info(body: &str, queried_url: &str) -> FfiResult<FfiWithdrawInfo> {
+pub fn parse_note_info(
+    body: &str,
+    queried_url: &str,
+    require_signatures: bool,
+) -> FfiResult<FfiWithdrawInfo> {
     let value = parse_body(body)?;
-    let info = protocol::parse_note_info(&value, queried_url)?;
+    let info =
+        protocol::parse_note_info(&value, queried_url, protocol::Policy { require_signatures })?;
     Ok(FfiWithdrawInfo {
         callback: info.callback,
         k1: info.k1,
@@ -500,7 +565,12 @@ pub fn parse_verify(body: &str) -> FfiResult<FfiVerify> {
 /// unknown, they come back attached to the error, so nothing can lose them
 /// between the call and the catch.
 #[uniffi::export]
-pub fn parse_mutation(body: &str, new_secrets: Vec<String>) -> FfiResult<FfiMutation> {
+pub fn parse_mutation(
+    body: &str,
+    new_secrets: Vec<String>,
+    kind: FfiMutationKind,
+    require_signatures: bool,
+) -> FfiResult<FfiMutation> {
     let value = match parse_body(body) {
         Ok(value) => value,
         Err(LnurlcashError::Ambiguous { detail, .. }) => {
@@ -511,7 +581,7 @@ pub fn parse_mutation(body: &str, new_secrets: Vec<String>) -> FfiResult<FfiMuta
         }
         Err(other) => return Err(other),
     };
-    match protocol::parse_mutation(&value) {
+    match protocol::parse_mutation(&value, kind.into(), protocol::Policy { require_signatures }) {
         Ok(response) => Ok(FfiMutation {
             signature: response.signature,
             change_signature: response.change_signature,

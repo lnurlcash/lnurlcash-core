@@ -13,6 +13,43 @@ and the adversarial mock mint.
 
 ### Design notes
 
+**Offline verification is mandatory, and this crate insists on it.** LUD-25
+stopped treating a note signature as optional: a SERVICE MUST publish
+`mintPubkey` and MUST sign every note a rotate, split or merge mints. So
+`parse_note_info` refuses a `withdrawRequest` publishing no `mintPubkey`, or
+one that is not a 33-byte compressed secp256k1 key, and `parse_mutation`
+raises `Error::Unverifiable` when a SERVICE confirms a mutation without
+signing it. `Policy { require_signatures: false }` opts out for a SERVICE that
+predates the requirement.
+
+That error carries the fresh secrets, and the reason matters: `status` was OK,
+so the mutation LANDED. The note exists at the hash the wallet disclosed and
+that secret is the only key to it, so enforcing the spec must never be the
+thing that strands the money.
+
+**A spent-or-unknown refusal from a mutation carries its secrets too.** At a
+SERVICE that has not implemented the replay rule below, a retried rotate,
+split or merge is answered as an already-spent input - so that refusal is also
+what a mutation the SERVICE ALREADY applied looks like. The crate cannot tell
+those apart at the wire, so `Error::NoteSpent` and `Error::NoteUnknown` are
+struct variants carrying `new_secrets`, and `Error::new_secrets()` reads them
+off any of the four families that carry them.
+
+**A mutation whose answer was lost is re-sent, and usually completes.** LUD-25
+gained a "Retrying a mutation" section: a SERVICE MUST answer a byte-identical
+rotate, split or merge with the success it already returned, signature and all,
+rather than with the already-spent refusal its burned inputs would earn. That
+closes the sharpest edge in the protocol - every mutation is a GET, HTTP treats
+GET as idempotent, and stacks retry a dropped one - so `Client` re-sends and
+the retry becomes invisible.
+
+`ClientConfig::mutation_retries` defaults to 1. The safety rules are the whole
+of it: never a melt, which carries `pr`, is paid asynchronously and has no
+replay guarantee; never a definitive refusal, which is the SERVICE's considered
+answer; and the `Request` is cloned rather than rebuilt, because the replay is
+matched on the k1 set, `h`, `h2` and `amount` - a regenerated secret would make
+the retry a different mutation, and a second real burn.
+
 **Minting is comment-bound, and the payment preimage is only settlement proof.**
 The draft keyed a fresh note by the invoice's payment preimage until 31 August
 2026, when that fallback was removed outright: a preimage propagates to every
