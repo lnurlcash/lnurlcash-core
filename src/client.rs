@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::errors::{Error, Result};
 use crate::note::with_new_k1;
-use crate::protocol::{self, Request};
+use crate::protocol::{self, MutationKind, Policy, Request};
 use crate::secrets::generate_note_secret;
 use crate::urls::is_allowed_service_url;
 
@@ -40,6 +40,22 @@ pub struct ClientConfig {
     /// or a deterministic test - and see [`generate_note_secret`] for what a
     /// caller takes on by doing so.
     pub secret_source: fn() -> String,
+    /// What this client insists a SERVICE does. See [`Policy`]; the default
+    /// requires the offline verification LUD-25 makes mandatory.
+    pub policy: Policy,
+    /// How many times to re-send a rotate, split or merge whose outcome the
+    /// transport lost.
+    ///
+    /// LUD-25 requires a SERVICE to answer a byte-identical retry with the
+    /// original success ("Retrying a mutation"), so re-sending resolves the
+    /// ambiguity rather than compounding it: a conforming SERVICE replays, and
+    /// one that refuses leaves the caller exactly where an un-retried failure
+    /// would have.
+    ///
+    /// Never applied to a melt, which carries `pr`, is paid out asynchronously
+    /// and has no replay guarantee at all. Defaults to 1; zero gives up on the
+    /// first ambiguous answer.
+    pub mutation_retries: u32,
 }
 
 impl Default for ClientConfig {
@@ -48,6 +64,8 @@ impl Default for ClientConfig {
             timeout: Duration::from_secs(30),
             offline: false,
             secret_source: generate_note_secret,
+            policy: Policy::default(),
+            mutation_retries: 1,
         }
     }
 }
@@ -149,15 +167,54 @@ impl Client {
         })
     }
 
-    async fn run_mutation(&self, request: Request) -> Result<protocol::MutationResponse> {
+    /// One mutating GET, re-sent while the transport keeps losing the answer.
+    ///
+    /// LUD-25's "Retrying a mutation" is what makes this safe and what makes it
+    /// useful: a SERVICE MUST answer a byte-identical rotate, split or merge
+    /// with the success it returned the first time, signature and all, rather
+    /// than with the already-spent refusal its burned inputs would otherwise
+    /// earn. So a second attempt turns "we don't know" into an answer.
+    ///
+    /// The request is cloned rather than rebuilt, because the replay is matched
+    /// on the k1 set, `h`, `h2` and `amount`. Regenerating a secret between
+    /// attempts would make the retry a DIFFERENT mutation, and against a
+    /// SERVICE that had already applied the first, a second real burn.
+    ///
+    /// Only ambiguity is retried. A definitive refusal is the SERVICE's
+    /// considered answer and asking again cannot improve it. A melt is never
+    /// retried at all - see [`ClientConfig::mutation_retries`].
+    async fn run_mutation(
+        &self,
+        request: Request,
+        kind: MutationKind,
+    ) -> Result<protocol::MutationResponse> {
         let secrets = request.new_secrets.clone();
-        let body = self.run(request).await?;
-        protocol::parse_mutation(&body).map_err(|err| err.with_secrets(secrets))
+        let attempts = if kind == MutationKind::Melt {
+            0
+        } else {
+            self.config.mutation_retries
+        };
+        let mut last = None;
+        for _ in 0..=attempts {
+            let outcome = async {
+                let body = self.run(request.clone()).await?;
+                protocol::parse_mutation(&body, kind, self.config.policy)
+            }
+            .await;
+            match outcome {
+                Ok(response) => return Ok(response),
+                Err(err) if err.is_ambiguous() => last = Some(err),
+                Err(err) => return Err(err.with_secrets(secrets)),
+            }
+        }
+        Err(last
+            .unwrap_or_else(|| Error::ambiguous("the mutation was never attempted"))
+            .with_secrets(secrets))
     }
 
     pub async fn fetch_note_info(&self, url: &str) -> Result<protocol::WithdrawRequestInfo> {
         let body = self.run(protocol::note_info_request(url)?).await?;
-        protocol::parse_note_info(&body, url)
+        protocol::parse_note_info(&body, url, self.config.policy)
     }
 
     pub async fn fetch_mint_address(&self, url: &str) -> Result<protocol::MintAddressInfo> {
@@ -167,7 +224,10 @@ impl Client {
 
     pub async fn melt_note(&self, callback: &str, k1: &str, pr: &str) -> Result<MeltOutcome> {
         let response = self
-            .run_mutation(protocol::melt_request(callback, k1, pr)?)
+            .run_mutation(
+                protocol::melt_request(callback, k1, pr)?,
+                MutationKind::Melt,
+            )
             .await?;
         Ok(MeltOutcome {
             pr: response.pr,
@@ -178,7 +238,10 @@ impl Client {
     pub async fn rotate_note(&self, callback: &str, k1: &str) -> Result<RotateOutcome> {
         let fresh = (self.config.secret_source)();
         let response = self
-            .run_mutation(protocol::rotate_request(callback, k1, &fresh)?)
+            .run_mutation(
+                protocol::rotate_request(callback, k1, &fresh)?,
+                MutationKind::Rotate,
+            )
             .await?;
         Ok(RotateOutcome {
             k1: fresh,
@@ -195,13 +258,10 @@ impl Client {
         let fresh = (self.config.secret_source)();
         let change = (self.config.secret_source)();
         let response = self
-            .run_mutation(protocol::split_request(
-                callback,
-                k1s,
-                amount_msat,
-                &fresh,
-                &change,
-            )?)
+            .run_mutation(
+                protocol::split_request(callback, k1s, amount_msat, &fresh, &change)?,
+                MutationKind::Split,
+            )
             .await?;
         Ok(SplitOutcome {
             k1: fresh,
@@ -214,7 +274,10 @@ impl Client {
     pub async fn merge_notes(&self, callback: &str, k1s: &[String]) -> Result<RotateOutcome> {
         let fresh = (self.config.secret_source)();
         let response = self
-            .run_mutation(protocol::merge_request(callback, k1s, &fresh)?)
+            .run_mutation(
+                protocol::merge_request(callback, k1s, &fresh)?,
+                MutationKind::Merge,
+            )
             .await?;
         Ok(RotateOutcome {
             k1: fresh,
@@ -272,7 +335,7 @@ impl Client {
     pub async fn probe_burned_note(&self, url: &str) -> NoteFate {
         match self.fetch_note_info(url).await {
             Ok(_) => NoteFate::Live,
-            Err(Error::NoteSpent(_)) | Err(Error::NoteUnknown(_)) => NoteFate::Gone,
+            Err(Error::NoteSpent { .. }) | Err(Error::NoteUnknown { .. }) => NoteFate::Gone,
             Err(_) => NoteFate::Unknown,
         }
     }

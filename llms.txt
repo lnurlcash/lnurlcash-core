@@ -17,12 +17,16 @@ protocol directly, and nothing async crosses the FFI boundary.
 ## Core API
 
 protocol::note_info_request(url) -> Request { url, new_secrets }
-protocol::parse_note_info(&Value, queried_url) -> WithdrawRequestInfo
+protocol::parse_note_info(&Value, queried_url, Policy) -> WithdrawRequestInfo
 protocol::rotate_request(callback, k1, new_secret) -> Request
 protocol::split_request(callback, k1s, amount_msat, new_secret, change_secret) -> Request
 protocol::merge_request(callback, k1s, new_secret) -> Request
 protocol::melt_request(callback, k1, bolt11) -> Request
-protocol::parse_mutation(&Value) -> MutationResponse
+protocol::parse_mutation(&Value, MutationKind, Policy) -> MutationResponse
+protocol::Policy { require_signatures }  default true: LUD-25 makes offline
+  verification mandatory, so a withdrawRequest with no mintPubkey and a
+  mutation with no sig are both refused. MutationKind::{Melt,Rotate,Split,
+  Merge} says what the response owes - a melt mints nothing and owes none.
 protocol::pay_request_request / invoice_request / verify_request + parse_*
 
 verify_note_signature(k1, amount_msat, sig_hex, mint_pubkey_hex) -> bool
@@ -41,14 +45,28 @@ fetch_invoice_verification, fetch_mint_address}
 Error::RequestRefused   nothing sent, note untouched
 Error::ServiceRejected  processed and refused (definitive)
 Error::NotePending      a melt is in flight on this k1 - retry, NOT spent
-Error::NoteSpent        authoritative: already burned
-Error::NoteUnknown      service does not recognise it
+Error::NoteSpent { reason, new_secrets }    authoritative at the info GET.
+  From a MUTATION at a service that will not replay a retry, it is also what
+  an ALREADY-APPLIED mutation looks like - read new_secrets before believing
+Error::NoteUnknown { reason, new_secrets }  service does not recognise it
 Error::Ambiguous { message, new_secrets }   outcome UNKNOWN
-Error::Protocol         a non-mutating response did not match the spec
+Error::Unverifiable { message, new_secrets }  the mutation LANDED and came
+  back unsigned. The note is REAL - persist new_secrets, then report the mint
+Error::Protocol         a non-mutating response did not match the spec,
+  which includes a withdrawRequest publishing no mintPubkey
 
 err.is_ambiguous() and err.is_definitive() are the two questions worth asking.
-err.new_secrets() carries the secrets out of an ambiguous mutation - PERSIST
-them before anything else, then probe_burned_note.
+err.new_secrets() carries the secrets out of any error that could describe a
+mutation the service applied - ambiguous, unverifiable, spent or unknown.
+PERSIST them before anything else, then probe_burned_note.
+
+client::ClientConfig { policy, mutation_retries, .. }
+  mutation_retries defaults to 1. LUD-25 requires a service to answer a
+  byte-identical retried rotate/split/merge with the original success, so a
+  lost answer is re-asked rather than given up on. NEVER a melt: it carries
+  pr, is paid asynchronously and has no replay guarantee. The request is
+  re-sent byte for byte - the replay is matched on the k1 set, h, h2 and
+  amount, so a fresh secret would make it a different mutation.
 
 ## Rules
 
