@@ -391,6 +391,88 @@ async fn settle_resolves_what_an_output_is_really_worth() {
     );
 }
 
+// settle_note's rotate is best-effort by design: a SERVICE that refuses it
+// keeps the exposed k1 rather than failing the whole operation. What that must
+// never cover is a rotate that MAY HAVE LANDED. Both used to return the old k1,
+// shaped identically to a success - and when the request had landed, that k1
+// was burned and the fresh secret riding the error was the only copy of the
+// note the SERVICE had just minted.
+
+#[tokio::test]
+async fn settle_surfaces_an_unconfirmable_rotate_rather_than_the_burned_k1() {
+    let mint = mint_or_skip!(&["--unconfirmedMutation=true"]);
+    let client = no_retry_client();
+    let k1 = secret(50);
+    mint.credit(&k1, 21000).await;
+
+    let err = client
+        .settle_note(&mint.note_url(&k1), &k1, 0, None)
+        .await
+        .expect_err("an unconfirmable rotate must not come back looking settled");
+
+    // the request did land, so the k1 the caller holds is dead
+    assert_eq!(mint.note_state(&k1).await.as_deref(), Some("burned"));
+    assert!(err.is_ambiguous(), "got {err:?}");
+
+    // and the fresh secret has to survive: it is the only copy of the note
+    let rescued = err.new_secrets();
+    assert_eq!(rescued.len(), 1, "the fresh secret must survive");
+    assert_ne!(rescued[0], k1);
+    assert_eq!(
+        mint.note_state(&rescued[0]).await.as_deref(),
+        Some("outstanding")
+    );
+}
+
+#[tokio::test]
+async fn settle_keeps_the_exposed_k1_when_the_service_definitively_refuses() {
+    let mint = mint_or_skip!(&["--meltNeverSettles=true"]);
+    let client = Client::new();
+    let k1 = secret(51);
+    mint.credit(&k1, 21000).await;
+    // a melt in flight locks every other operation on the note out, so the
+    // rotate is refused for a reason that burned nothing
+    client
+        .melt_note(&mint.callback(), &k1, "lnbc210n1pjqrstuvwxyz")
+        .await
+        .unwrap();
+
+    let settled = client
+        .settle_note(&mint.note_url(&k1), &k1, 0, None)
+        .await
+        .expect("a refusal that burned nothing leaves the note settleable");
+
+    // the SERVICE answered and burned nothing, so the note is still the note
+    assert_eq!(settled.k1, k1);
+    assert_eq!(settled.amount_msat, 21000);
+    assert_eq!(mint.note_state(&k1).await.as_deref(), Some("pending"));
+}
+
+/// A retried mutation the SERVICE already performed looks exactly like this
+/// from the wire, so the fresh secret still matters - see [`Error::NoteSpent`].
+/// Swallowing it returned the burned k1 as settled.
+#[tokio::test]
+async fn settle_surfaces_a_spent_refusal_that_may_describe_an_applied_rotate() {
+    let mint = mint_or_skip!(&["--unconfirmedMutation=true", "--retriedMutation=refuse"]);
+    let client = Client::new();
+    let k1 = secret(52);
+    mint.credit(&k1, 21000).await;
+
+    let err = client
+        .settle_note(&mint.note_url(&k1), &k1, 0, None)
+        .await
+        .expect_err("a spent refusal must not come back looking settled");
+
+    assert!(matches!(err, Error::NoteSpent { .. }), "got {err:?}");
+    let rescued = err.new_secrets();
+    assert_eq!(rescued.len(), 1);
+    assert_ne!(rescued[0], k1);
+    assert_eq!(
+        mint.note_state(&rescued[0]).await.as_deref(),
+        Some("outstanding")
+    );
+}
+
 // ---- melt ----
 
 #[tokio::test]
