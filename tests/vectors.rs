@@ -4,16 +4,16 @@
 
 use std::path::PathBuf;
 
-use lnurlcash_core::protocol::{
-    mint_invoice_request, mint_invoice_request_with_hash, parse_invoice, parse_pay_request,
-    parse_verify,
-};
 use lnurlcash_core::cash::{
     cash_domain_indices, cash_node_from_hex, cash_node_to_hex, cash_secret_at, derive_cash_child,
     derive_cash_domain_node, derive_cash_root, derive_cash_secret,
 };
-use lnurlcash_core::secrets::{derive_note_root, derive_note_secret};
 use lnurlcash_core::hash_k1;
+use lnurlcash_core::protocol::{
+    mint_invoice_request, mint_invoice_request_with_hash, parse_invoice, parse_pay_request,
+    parse_verify,
+};
+use lnurlcash_core::secrets::{derive_note_root, derive_note_secret};
 use lnurlcash_core::{
     apply_mint_fee, build_note_url, decode_bolt11_amount_msat, format_fee_percent,
     from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url, is_bolt11_invoice,
@@ -552,7 +552,11 @@ fn cash_derivation_vectors() {
             k1,
             "{name}: from the domain node alone"
         );
-        assert_eq!(hash_k1(&k1).expect("hash"), str_of(case, "noteId"), "{name}");
+        assert_eq!(
+            hash_k1(&k1).expect("hash"),
+            str_of(case, "noteId"),
+            "{name}"
+        );
     }
 }
 
@@ -569,8 +573,16 @@ fn legacy_derivation_vectors() {
         let name = str_of(case, "name");
         let seed = hex::decode(str_of(case, "seedHex")).expect("seedHex is hex");
         let root = derive_note_root(&seed);
-        let k1 = derive_note_secret(&root, &str_of(case, "host"), case["index"].as_u64().unwrap() as u32);
+        let k1 = derive_note_secret(
+            &root,
+            &str_of(case, "host"),
+            case["index"].as_u64().unwrap() as u32,
+        );
         assert_eq!(k1, str_of(case, "k1"), "{name}");
-        assert_eq!(hash_k1(&k1).expect("hash"), str_of(case, "noteId"), "{name}");
+        assert_eq!(
+            hash_k1(&k1).expect("hash"),
+            str_of(case, "noteId"),
+            "{name}"
+        );
     }
 }

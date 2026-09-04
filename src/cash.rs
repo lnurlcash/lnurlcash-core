@@ -131,8 +131,9 @@ fn master_from(seed: &[u8]) -> Result<CashNode> {
     let material = hmac512(b"Bitcoin seed", seed);
     let mut private_key = [0u8; 32];
     private_key.copy_from_slice(&material[..32]);
-    SecretKey::from_slice(&private_key)
-        .map_err(|_| Error::Protocol("this seed does not produce a valid BIP-32 master key".into()))?;
+    SecretKey::from_slice(&private_key).map_err(|_| {
+        Error::Protocol("this seed does not produce a valid BIP-32 master key".into())
+    })?;
     let mut chain_code = [0u8; 32];
     chain_code.copy_from_slice(&material[32..]);
     Ok(CashNode {

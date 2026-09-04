@@ -364,7 +364,6 @@ pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<Strin
     note::build_note_info_url_by_hash(withdraw_link, h)
 }
 
-
 #[uniffi::export]
 pub fn resolve_note_input(value: &str) -> Option<String> {
     note::resolve_note_input(value)
