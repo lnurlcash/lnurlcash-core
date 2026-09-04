@@ -369,6 +369,21 @@ impl Client {
     /// an informational GET - and a fee-charging SERVICE may have deducted from
     /// a split's change or refunded into a merge's result. That GET puts k1 on
     /// the wire, so a rotate follows, best-effort.
+    ///
+    /// "Best-effort" means a rotate the SERVICE definitively REFUSED. It cannot
+    /// mean one that MAY have landed. This used to be a blanket `Err(_)`, which
+    /// covered both and returned the exposed k1 either way, shaped exactly like
+    /// a success. When the request had in fact landed, the SERVICE had burned
+    /// that k1 and minted the rotated note under `h`, whose only copy anywhere
+    /// was the fresh secret [`Error::with_secrets`] attaches for precisely this
+    /// reason. Discarding it handed the caller a dead secret and dropped the
+    /// live one: an unrecoverable loss of a bearer note, reported as a settled
+    /// one.
+    ///
+    /// It is the last place that can go wrong, too. The mutation has already
+    /// been re-sent the way LUD-25's "Retrying a mutation" requires - see
+    /// [`ClientConfig::mutation_retries`] - so anything uncertain arriving here
+    /// has exhausted them.
     pub async fn settle_note(
         &self,
         base_url: &str,
@@ -386,12 +401,29 @@ impl Client {
                 signature: rotated.signature,
                 callback: info.callback,
             }),
-            Err(_) => Ok(SettledNote {
-                k1: k1.to_string(),
-                amount_msat: info.max_withdrawable,
-                signature: signature.map(|s| s.to_string()),
-                callback: info.callback,
-            }),
+            // The SERVICE answered, and its answer burned nothing: the exposed
+            // k1 and its signature are still the note, so keeping them is
+            // better than failing the whole settle over a rotate.
+            //
+            // Named rather than defaulted to. Every other variant either
+            // carries fresh secrets or admits the mutation may have applied -
+            // see the taxonomy in [`crate::errors`] - and a variant added to
+            // that taxonomy later must surface here rather than silently join
+            // the swallowed set.
+            Err(Error::RequestRefused(_) | Error::ServiceRejected(_) | Error::NotePending) => {
+                Ok(SettledNote {
+                    k1: k1.to_string(),
+                    amount_msat: info.max_withdrawable,
+                    signature: signature.map(|s| s.to_string()),
+                    callback: info.callback,
+                })
+            }
+            // Ambiguous and Unverifiable both mean the rotate reached the
+            // SERVICE; NoteSpent and NoteUnknown are also exactly what a
+            // mutation it ALREADY applied looks like asked a second time. In
+            // every one of those the note behind `h` may exist, and the secret
+            // riding the error is the only key to it.
+            Err(err) => Err(err),
         }
     }
 }

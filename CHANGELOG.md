@@ -58,6 +58,18 @@ those apart at the wire, so `Error::NoteSpent` and `Error::NoteUnknown` are
 struct variants carrying `new_secrets`, and `Error::new_secrets()` reads them
 off any of the four families that carry them.
 
+**`settle_note`'s best-effort rotate covers a refusal, never an uncertainty.**
+Settling reads what an output is really worth, which puts `k1` on the wire, so
+a rotate follows to replace the exposed secret. That rotate is allowed to fail:
+a SERVICE that refuses it has burned nothing, and keeping the exposed `k1` beats
+failing the whole settle. It is allowed to fail for that reason and no other -
+`Error::RequestRefused`, `Error::ServiceRejected` and `Error::NotePending`, and
+nothing else. Every other variant either carries fresh secrets or admits the
+mutation may have applied, and returning the old `k1` there hands back a secret
+the SERVICE has burned while dropping the only copy of the note it just minted.
+The arms are named rather than defaulted to, so a variant added to the taxonomy
+later surfaces instead of silently joining the swallowed set.
+
 **A mutation whose answer was lost is re-sent, and usually completes.** LUD-25
 gained a "Retrying a mutation" section: a SERVICE MUST answer a byte-identical
 rotate, split or merge with the success it already returned, signature and all,
