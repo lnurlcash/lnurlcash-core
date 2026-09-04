@@ -44,6 +44,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod bolt11;
+pub mod cash;
 #[cfg(feature = "client")]
 pub mod client;
 pub mod errors;

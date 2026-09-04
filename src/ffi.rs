@@ -19,7 +19,7 @@
 //!    you saved in step 1 may be the only copy of the money
 
 use crate::errors::Error;
-use crate::{bolt11, fees, note, protocol, secrets, signature, urls};
+use crate::{bolt11, cash, errors, fees, note, protocol, secrets, signature, urls};
 
 /// One GET, and the secrets whose loss would destroy money.
 #[derive(Debug, uniffi::Record)]
@@ -279,7 +279,91 @@ pub fn verify_note_signature(
     signature::verify_note_signature(k1, amount_msat, signature_hex, mint_pubkey_hex)
 }
 
+// ---- seed-recoverable note secrets ----
+//
+// Nodes cross this boundary as 64 bytes of hex - privateKey || chainCode - so
+// a binding never has to model a BIP-32 key, and so the value a caller
+// persists is the value it passes back. That hex IS bearer material for every
+// note beneath it: store it the way the notes are stored, and never log it.
+
+/// `m/139'` from a seed, as a 64-byte hex node. `seed_hex` is raw seed bytes;
+/// a 64-byte BIP39 seed is the interop case.
+#[uniffi::export]
+pub fn derive_cash_root(seed_hex: &str) -> FfiResult<String> {
+    let seed = hex::decode(seed_hex.trim())
+        .map_err(|_| errors::Error::Protocol("a seed must be hex".into()))?;
+    Ok(cash::cash_node_to_hex(&cash::derive_cash_root(&seed)?))
+}
+
+/// `m/139'/d1/d2/d3/d4` for one mint, as a 64-byte hex node.
+///
+/// Every unhardened level in LUD-25's path is at or above this node, so a
+/// hardware signer given THIS rather than the seed needs no elliptic curve:
+/// each index beneath it is one hardened step. Whoever derives it can derive
+/// every note secret held at that mint, so it is provisioning material - one
+/// mint's subtree, not the wallet.
+#[uniffi::export]
+pub fn derive_cash_domain_node(root_hex: &str, host: &str) -> FfiResult<String> {
+    let root = cash::cash_node_from_hex(root_hex)?;
+    Ok(cash::cash_node_to_hex(&cash::derive_cash_domain_node(
+        &root, host,
+    )?))
+}
+
+/// The i-th note secret beneath a mint's domain node.
+#[uniffi::export]
+pub fn cash_secret_at(domain_node_hex: &str, index: u32) -> FfiResult<String> {
+    let node = cash::cash_node_from_hex(domain_node_hex)?;
+    Ok(cash::cash_secret_at(&node, index)?)
+}
+
+/// The i-th note secret at a mint, from the root. Re-derives the domain node
+/// each call; hold the node for a run of secrets.
+#[uniffi::export]
+pub fn derive_cash_secret(root_hex: &str, host: &str, index: u32) -> FfiResult<String> {
+    let root = cash::cash_node_from_hex(root_hex)?;
+    Ok(cash::derive_cash_secret(&root, host, index)?)
+}
+
+/// The four raw uint32 levels a mint's subtree hangs off. Exposed for a wallet
+/// diagnosing a restore that finds nothing.
+#[uniffi::export]
+pub fn cash_domain_indices(root_hex: &str, host: &str) -> FfiResult<Vec<u32>> {
+    let root = cash::cash_node_from_hex(root_hex)?;
+    Ok(cash::cash_domain_indices(&root, host)?.to_vec())
+}
+
+/// The LEGACY scheme's root, for finding notes minted before LUD-25 specified
+/// a derivation. Do not mint under it.
+#[uniffi::export]
+pub fn derive_note_root(seed_hex: &str) -> FfiResult<String> {
+    let seed = hex::decode(seed_hex.trim())
+        .map_err(|_| errors::Error::Protocol("a seed must be hex".into()))?;
+    Ok(hex::encode(secrets::derive_note_root(&seed)))
+}
+
+/// The LEGACY scheme's i-th secret at `host`. Do not mint under it.
+#[uniffi::export]
+pub fn derive_note_secret(root_hex: &str, host: &str, index: u32) -> FfiResult<String> {
+    let bytes = hex::decode(root_hex.trim())
+        .map_err(|_| errors::Error::Protocol("a root must be hex".into()))?;
+    if bytes.len() != 32 {
+        return Err(errors::Error::Protocol("a legacy root is 32 bytes".into()).into());
+    }
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&bytes);
+    Ok(secrets::derive_note_secret(&root, host, index))
+}
+
 // ---- urls and notes ----
+
+/// The informational GET for a note named by its hash rather than its secret,
+/// so nothing spendable goes on the wire. What a restore walk uses.
+#[uniffi::export]
+pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<String> {
+    note::build_note_info_url_by_hash(withdraw_link, h)
+}
+
 
 #[uniffi::export]
 pub fn resolve_note_input(value: &str) -> Option<String> {

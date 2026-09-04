@@ -31,6 +31,26 @@ protocol::pay_request_request / invoice_request / verify_request + parse_*
 
 verify_note_signature(k1, amount_msat, sig_hex, mint_pubkey_hex) -> bool
 generate_note_secret() -> String    hash_k1(k1) -> Result<String>
+
+cash::derive_cash_root(seed) -> CashNode        LUD-25's scheme, BIP-32 m/139'
+cash::derive_cash_domain_node(root, host)       m/139'/d1/d2/d3/d4, d1..d4 =
+  HMAC-SHA256(privkey at m/139'/0, host)[0..16] as 4 RAW big-endian uint32.
+  RAW: BIP-32 reads >= 2^31 as hardened, so ~half the levels are, decided by
+  the host name. NEVER mask the top bit, NEVER harden all four - either
+  derives a different tree and restores nothing, silently.
+cash::derive_cash_secret(root, host, i) / cash::cash_secret_at(node, i)
+  below the domain node there is no unhardened level, so a signer given the
+  node needs no curve - that is why the node is its own step
+cash::cash_node_to_hex / from_hex     privateKey || chainCode, 64 bytes
+cash::derive_cash_child(node, raw_u32)          BIP-32 CKDpriv, for checking
+  this crate against BIP-32's own vectors
+cash::CashSecretSource::{new, next_secret, next_index}
+secrets::derive_note_root / derive_note_secret  LEGACY pre-spec HMAC scheme.
+  Do not mint under it; still scanned so old notes stay findable.
+note::build_note_info_url_by_hash(withdraw_link, h) -> Option<String>
+  the ?h= informational GET, so a restore walk keeps secrets off the wire.
+  A rejection proves nothing: unsupported, unknown and BURNED are one answer.
+  The persisted per-host counter is the real backup, not the scan.
 resolve_note_input / resolve_mint_input / resolve_lnurl_input
 parse_mint_fee / apply_mint_fee / gross_up_for_mint_fee
 build_note_url / with_new_k1 / without_k1
