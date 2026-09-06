@@ -175,6 +175,9 @@ pub struct FfiMintAddress {
     pub node_capacity_msat: Option<u64>,
     pub node_num_channels: Option<u64>,
     pub node_num_peers: Option<u64>,
+    pub node_uris: Option<Vec<String>>,
+    pub sunset_date: Option<String>,
+    pub outstanding_notes_msat: Option<u64>,
 }
 
 #[derive(Debug, uniffi::Record)]
@@ -594,6 +597,9 @@ pub fn parse_mint_address(body: &str) -> FfiResult<FfiMintAddress> {
         node_capacity_msat: info.node_capacity_msat,
         node_num_channels: info.node_num_channels,
         node_num_peers: info.node_num_peers,
+        node_uris: info.node_uris,
+        sunset_date: info.sunset_date,
+        outstanding_notes_msat: info.outstanding_notes_msat,
     })
 }
 
