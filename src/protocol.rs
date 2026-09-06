@@ -125,6 +125,25 @@ pub struct MintAddressInfo {
     pub node_capacity_msat: Option<u64>,
     pub node_num_channels: Option<u64>,
     pub node_num_peers: Option<u64>,
+    /// Every address the SERVICE's node announces, each already
+    /// `node_key@host:port`. `node_uri` is the first of them; a node behind
+    /// Tor as well as clearnet has more, and a caller that can only reach the
+    /// other one needs the whole list. `None`, never an empty vector, when
+    /// the SERVICE announces nothing.
+    pub node_uris: Option<Vec<String>>,
+    /// The day the SERVICE plans to close, ISO-8601 (`2026-12-31`). Advance
+    /// warning while there is still time to spend, deliberately not the same
+    /// thing as a mint that has already stopped minting. Nothing enforces it
+    /// and nothing verifies it, so it is a prompt to move notes, never a
+    /// deadline to compute against. A value that is not a real calendar day
+    /// is dropped rather than passed on: the one thing a WALLET does with
+    /// this is show it to a holder.
+    pub sunset_date: Option<String>,
+    /// What the SERVICE says it owes, msat: every note it has issued and not
+    /// burned. Its own claim about its own database, with nothing to check it
+    /// against, so it is worth reading next to what the node holds and worth
+    /// little on its own.
+    pub outstanding_notes_msat: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +215,55 @@ pub struct MutationResponse {
 
 fn as_str(body: &Value, key: &str) -> Option<String> {
     body.get(key)?.as_str().map(|s| s.to_string())
+}
+
+/// Non-empty strings only, and `None` rather than an empty vector for a list
+/// that had none: a caller testing `is_some()` and one testing `len()` have to
+/// reach the same conclusion about a SERVICE that announced nothing.
+fn as_str_list(body: &Value, key: &str) -> Option<Vec<String>> {
+    let entries: Vec<String> = body
+        .get(key)?
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.as_str())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect();
+    (!entries.is_empty()).then_some(entries)
+}
+
+/// A calendar day, `YYYY-MM-DD`, and nothing else. A timestamp, a
+/// locale-formatted date or a typo is dropped rather than passed on, because
+/// the one thing a WALLET does with this is put it in front of a holder and a
+/// wrong date there is worse than no date. `2026-02-31` fails here rather than
+/// arriving as a day nobody meant.
+fn as_iso_date(body: &Value, key: &str) -> Option<String> {
+    let raw = body.get(key)?.as_str()?;
+    let bytes = raw.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    if !raw.char_indices().all(|(i, c)| {
+        if i == 4 || i == 7 {
+            c == '-'
+        } else {
+            c.is_ascii_digit()
+        }
+    }) {
+        return None;
+    }
+    let year: u32 = raw[0..4].parse().ok()?;
+    let month: u32 = raw[5..7].parse().ok()?;
+    let day: u32 = raw[8..10].parse().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let last = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    (day >= 1 && day <= last).then(|| raw.to_string())
 }
 
 fn as_u64(body: &Value, key: &str) -> Option<u64> {
@@ -365,6 +433,9 @@ pub fn parse_mint_address(body: &Value) -> Result<MintAddressInfo> {
         node_capacity_msat: as_u64(body, "nodeCapacity"),
         node_num_channels: as_u64(body, "nodeNumChannels"),
         node_num_peers: as_u64(body, "nodeNumPeers"),
+        node_uris: as_str_list(body, "nodeUris"),
+        sunset_date: as_iso_date(body, "sunsetDate"),
+        outstanding_notes_msat: as_u64(body, "outstandingNotesMsat"),
     })
 }
 
@@ -701,4 +772,110 @@ pub fn parse_verify(body: &Value) -> Result<VerifyResult> {
         preimage: as_str(body, "preimage"),
         pr: as_str(body, "pr").ok_or_else(invalid)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn address(extra: Value) -> Value {
+        let mut body = json!({
+            "tag": "withdrawRequest",
+            "callback": "https://mint.example/w/cb",
+            "payLink": "https://mint.example/.well-known/lnurlp/mint",
+            "minWithdrawable": 1000u64,
+            "maxWithdrawable": 100_000_000u64,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    }
+
+    #[test]
+    fn reads_every_address_the_node_announces() {
+        let clearnet = "02aa@2.29.14.244:9735";
+        let onion = "02aa@abcdefghijklmnop.onion:9735";
+        let info = parse_mint_address(&address(json!({
+            "nodeUri": clearnet,
+            "nodeUris": [clearnet, onion],
+        })))
+        .unwrap();
+
+        assert_eq!(
+            info.node_uris,
+            Some(vec![clearnet.to_string(), onion.to_string()])
+        );
+        // the singular field is unchanged and still the first address
+        assert_eq!(info.node_uri.as_deref(), Some(clearnet));
+    }
+
+    #[test]
+    fn an_announced_nothing_is_none_not_empty() {
+        assert_eq!(
+            parse_mint_address(&address(json!({}))).unwrap().node_uris,
+            None
+        );
+        assert_eq!(
+            parse_mint_address(&address(json!({"nodeUris": []})))
+                .unwrap()
+                .node_uris,
+            None
+        );
+        assert_eq!(
+            parse_mint_address(&address(json!({"nodeUris": "not a list"})))
+                .unwrap()
+                .node_uris,
+            None
+        );
+        assert_eq!(
+            parse_mint_address(&address(json!({"nodeUris": [1, "a", "", null]})))
+                .unwrap()
+                .node_uris,
+            Some(vec!["a".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_closing_date_is_a_calendar_day_or_nothing() {
+        let date = |value: Value| {
+            parse_mint_address(&address(json!({"sunsetDate": value})))
+                .unwrap()
+                .sunset_date
+        };
+        assert_eq!(date(json!("2026-12-31")), Some("2026-12-31".to_string()));
+        assert_eq!(date(json!("2028-02-29")), Some("2028-02-29".to_string()));
+        assert_eq!(date(json!("31/12/2026")), None);
+        assert_eq!(date(json!("2026-12-31T09:00:00Z")), None);
+        // not a real day: February never has 31, and 2026 is not a leap year
+        assert_eq!(date(json!("2026-02-31")), None);
+        assert_eq!(date(json!("2026-02-29")), None);
+        assert_eq!(date(json!("2026-13-01")), None);
+        assert_eq!(date(json!("2026-00-10")), None);
+        assert_eq!(date(json!("2026-12-00")), None);
+        assert_eq!(date(json!(20261231)), None);
+        assert_eq!(
+            parse_mint_address(&address(json!({}))).unwrap().sunset_date,
+            None
+        );
+    }
+
+    #[test]
+    fn what_a_mint_says_it_owes_keeps_zero_distinct_from_silence() {
+        let owed = |body: Value| parse_mint_address(&body).unwrap().outstanding_notes_msat;
+        assert_eq!(
+            owed(address(json!({"outstandingNotesMsat": 48_000u64}))),
+            Some(48_000)
+        );
+        assert_eq!(
+            owed(address(json!({"outstandingNotesMsat": 0u64}))),
+            Some(0)
+        );
+        assert_eq!(owed(address(json!({}))), None);
+        assert_eq!(
+            owed(address(json!({"outstandingNotesMsat": "48000"}))),
+            None
+        );
+    }
 }
