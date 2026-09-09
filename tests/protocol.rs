@@ -425,27 +425,37 @@ async fn settle_surfaces_an_unconfirmable_rotate_rather_than_the_burned_k1() {
 }
 
 #[tokio::test]
-async fn settle_keeps_the_exposed_k1_when_the_service_definitively_refuses() {
+async fn settle_reports_a_note_whose_melt_is_still_in_flight_as_pending() {
     let mint = mint_or_skip!(&["--meltNeverSettles=true"]);
     let client = Client::new();
     let k1 = secret(51);
     mint.credit(&k1, 21000).await;
-    // a melt in flight locks every other operation on the note out, so the
-    // rotate is refused for a reason that burned nothing
+    // a melt in flight locks every other operation on the note out, and the
+    // SERVICE now says so on the informational GET as well as the mutation:
+    // an unresolved melt answers `pending` rather than describing the note
     client
         .melt_note(&mint.callback(), &k1, "lnbc210n1pjqrstuvwxyz")
         .await
         .unwrap();
 
-    let settled = client
+    // So settling stops before the rotate, and the caller hears the one word
+    // that matters. This USED to come back as a settled 21000 msat note, on
+    // the reasoning that a refusal which burned nothing leaves the note
+    // alone - true of the rotate, but the wrong thing to tell a holder: the
+    // melt may be about to consume this note, and a caller told it settled
+    // would be counting money that is already leaving. Pending is not a
+    // failure, it is an answer, and the caller reconciles rather than
+    // believing either that the note is gone or that it is safely theirs.
+    let err = client
         .settle_note(&mint.note_url(&k1), &k1, 0, None)
         .await
-        .expect("a refusal that burned nothing leaves the note settleable");
+        .expect_err("a note with a melt in flight is not a settled note");
+    assert!(matches!(err, Error::NotePending), "got {err:?}");
 
-    // the SERVICE answered and burned nothing, so the note is still the note
-    assert_eq!(settled.k1, k1);
-    assert_eq!(settled.amount_msat, 21000);
+    // nothing was burned getting that answer, and no fresh secret was minted
+    // that a caller would now have to keep
     assert_eq!(mint.note_state(&k1).await.as_deref(), Some("pending"));
+    assert!(err.new_secrets().is_empty());
 }
 
 /// A retried mutation the SERVICE already performed looks exactly like this
