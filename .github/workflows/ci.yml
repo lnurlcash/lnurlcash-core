@@ -26,7 +26,7 @@ jobs:
           node-version: '22'
       - uses: actions/checkout@v4
         with:
-          repository: TheCryptoDonkey/lnurlcash-conformance
+          repository: lnurlcash/lnurlcash-conformance
           path: conformance
       - uses: Swatinem/rust-cache@v2
       # the mock mint is a Node process with its own dependencies - without
