@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::secrets::is_preimage;
+use crate::recoverable::{is_cp1, note_id_of};
 use crate::urls::{from_lud17, resolve_lnurl_input};
 
 fn first_param(url: &str, key: &str) -> Option<String> {
@@ -34,12 +34,13 @@ pub fn note_signature(url: &str) -> Option<String> {
 }
 
 /// Input only qualifies as a note if it resolves to a URL carrying a
-/// well-formed k1: 32 bytes hex. A k1 that is not hex would fail during hashing
-/// later, so it is refused at the door.
+/// well-formed k1: 32 bytes hex, or a Part 2 `ck1` that recovers to a key.
+/// Anything else has no note id, and would fail the first offline signature
+/// check later, so it is refused at the door.
 pub fn resolve_note_input(value: &str) -> Option<String> {
     let url = resolve_lnurl_input(value)?;
     let k1 = note_k1(&url)?;
-    is_preimage(&k1).then_some(url)
+    note_id_of(&k1).is_some().then_some(url)
 }
 
 pub fn is_valid_note_input(value: &str) -> bool {
@@ -91,13 +92,19 @@ pub fn build_note_url(withdraw_link: &str, k1: &str, amount_msat: Option<u64>) -
 /// `k1`, `amount` and `sig` are dropped: naming the note twice, once in a form
 /// that spends it, would defeat the point.
 ///
+/// `h` may also be a Part 2 `cp1` key, sent as `p`, the name LUD-25 now uses.
+/// A hash keeps the older `h`, which every mint that ever took a hash lookup
+/// understands. [`crate::recoverable::note_lookup_of`] gives the right one
+/// for either kind of k1.
+///
 /// A SERVICE that does not index by hash answers exactly as it answers for an
 /// unknown `k1`, which LUD-25 requires, so a rejection here never distinguishes
 /// "not supported" from "no such note" - and a burned note is deliberately
 /// indistinguishable from one that never existed.
 pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<String> {
-    let hex = h.trim().to_ascii_lowercase();
-    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let value = h.trim().to_ascii_lowercase();
+    let key = is_cp1(&value);
+    if !key && (value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit())) {
         return None;
     }
     let url = Url::parse(&from_lud17(withdraw_link.trim())).ok()?;
@@ -106,7 +113,7 @@ pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<Strin
         .filter(|(k, _)| k != "k1" && k != "amount" && k != "sig")
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
-    pairs.push(("h".into(), hex));
+    pairs.push((if key { "p" } else { "h" }.into(), value));
     Some(rebuild(&url, pairs))
 }
 

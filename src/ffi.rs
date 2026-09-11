@@ -19,7 +19,7 @@
 //!    you saved in step 1 may be the only copy of the money
 
 use crate::errors::Error;
-use crate::{bolt11, cash, errors, fees, note, protocol, secrets, signature, urls};
+use crate::{bolt11, cash, errors, fees, note, protocol, recoverable, secrets, signature, urls};
 
 /// One GET, and the secrets whose loss would destroy money.
 #[derive(Debug, uniffi::Record)]
@@ -272,6 +272,8 @@ pub fn is_preimage(value: &str) -> bool {
 
 /// Verify a note's signature against the mint's pubkey, offline. Accepts the
 /// recovery id at either end, because implementations disagree about which.
+///
+/// `k1` may be a Part 2 `ck1`, and `signature_hex` a Part 2 `cs1`.
 #[uniffi::export]
 pub fn verify_note_signature(
     k1: &str,
@@ -280,6 +282,18 @@ pub fn verify_note_signature(
     mint_pubkey_hex: &str,
 ) -> bool {
     signature::verify_note_signature(k1, amount_msat, signature_hex, mint_pubkey_hex)
+}
+
+/// The same check by the note's id - a hash, or a Part 2 note's public key as
+/// hex - for a caller that holds the id but not the k1 that spends it.
+#[uniffi::export]
+pub fn verify_note_signature_hash(
+    h: &str,
+    amount_msat: u64,
+    signature_hex: &str,
+    mint_pubkey_hex: &str,
+) -> bool {
+    signature::verify_note_signature_hash(h, amount_msat, signature_hex, mint_pubkey_hex)
 }
 
 // ---- seed-recoverable note secrets ----
@@ -336,6 +350,24 @@ pub fn cash_domain_indices(root_hex: &str, host: &str) -> FfiResult<Vec<u32>> {
     Ok(cash::cash_domain_indices(&root, host)?.to_vec())
 }
 
+/// The BIP-32 master node of a seed, for walking a path this crate does not
+/// name.
+#[uniffi::export]
+pub fn derive_cash_master(seed_hex: &str) -> FfiResult<String> {
+    let seed = hex::decode(seed_hex.trim())
+        .map_err(|_| errors::Error::Protocol("a seed must be hex".into()))?;
+    Ok(cash::cash_node_to_hex(&cash::derive_cash_master(&seed)?))
+}
+
+/// One BIP-32 CKDpriv step, hardened when `index >= 2^31` and only then.
+#[uniffi::export]
+pub fn derive_cash_child(node_hex: &str, index: u32) -> FfiResult<String> {
+    let node = cash::cash_node_from_hex(node_hex)?;
+    Ok(cash::cash_node_to_hex(&cash::derive_cash_child(
+        &node, index,
+    )?))
+}
+
 /// The LEGACY scheme's root, for finding notes minted before LUD-25 specified
 /// a derivation. Do not mint under it.
 #[uniffi::export]
@@ -358,10 +390,215 @@ pub fn derive_note_secret(root_hex: &str, host: &str, index: u32) -> FfiResult<S
     Ok(secrets::derive_note_secret(&root, host, index))
 }
 
+// ---- LUD-25 Part 2: notes keyed by a public key ----
+//
+// Raw bytes cross as hex, as everywhere else here, and the four bech32m
+// strings as themselves. A note secret key, a `ck1`, an address node and a
+// Nostr cash seed are all bearer material: store them the way the notes are
+// stored, and never log them. A `cx1` spends nothing, but links every note on
+// its branch.
+
+fn hex_array<const N: usize>(value: &str, what: &str) -> FfiResult<[u8; N]> {
+    let bytes = hex::decode(value.trim())
+        .map_err(|_| errors::Error::Protocol(format!("{what} must be hex")))?;
+    let length = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| errors::Error::Protocol(format!("{what} is {N} bytes, not {length}")).into())
+}
+
+/// A watch-only branch, both halves as hex.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiCx1 {
+    pub pubkey_x_only: String,
+    pub chain_code: String,
+}
+
+impl From<recoverable::Cx1> for FfiCx1 {
+    fn from(cx1: recoverable::Cx1) -> Self {
+        FfiCx1 {
+            pubkey_x_only: hex::encode(cx1.pubkey_x_only),
+            chain_code: hex::encode(cx1.chain_code),
+        }
+    }
+}
+
+/// A note's 32-byte x-only public key as a `cp1`.
+#[uniffi::export]
+pub fn encode_cp1(pubkey_x_only_hex: &str) -> FfiResult<String> {
+    Ok(recoverable::encode_cp1(&hex_array(
+        pubkey_x_only_hex,
+        "a note pubkey",
+    )?))
+}
+
+#[uniffi::export]
+pub fn decode_cp1(value: &str) -> Option<String> {
+    recoverable::decode_cp1(value).map(hex::encode)
+}
+
+#[uniffi::export]
+pub fn is_cp1(value: &str) -> bool {
+    recoverable::is_cp1(value)
+}
+
+/// A 65-byte ownership signature as a `ck1`: the string that spends the note.
+#[uniffi::export]
+pub fn encode_ck1(signature_hex: &str) -> FfiResult<String> {
+    Ok(recoverable::encode_ck1(&hex_array(
+        signature_hex,
+        "an ownership signature",
+    )?))
+}
+
+#[uniffi::export]
+pub fn decode_ck1(value: &str) -> Option<String> {
+    recoverable::decode_ck1(value).map(hex::encode)
+}
+
+#[uniffi::export]
+pub fn is_ck1(value: &str) -> bool {
+    recoverable::is_ck1(value)
+}
+
+/// A mint's 65-byte certificate as a `cs1`.
+#[uniffi::export]
+pub fn encode_cs1(signature_hex: &str) -> FfiResult<String> {
+    Ok(recoverable::encode_cs1(&hex_array(
+        signature_hex,
+        "a certificate",
+    )?))
+}
+
+#[uniffi::export]
+pub fn decode_cs1(value: &str) -> Option<String> {
+    recoverable::decode_cs1(value).map(hex::encode)
+}
+
+#[uniffi::export]
+pub fn is_cs1(value: &str) -> bool {
+    recoverable::is_cs1(value)
+}
+
+#[uniffi::export]
+pub fn encode_cx1(pubkey_x_only_hex: &str, chain_code_hex: &str) -> FfiResult<String> {
+    Ok(recoverable::encode_cx1(
+        &hex_array(pubkey_x_only_hex, "a branch pubkey")?,
+        &hex_array(chain_code_hex, "a chain code")?,
+    ))
+}
+
+#[uniffi::export]
+pub fn decode_cx1(value: &str) -> Option<FfiCx1> {
+    recoverable::decode_cx1(value).map(Into::into)
+}
+
+#[uniffi::export]
+pub fn is_cx1(value: &str) -> bool {
+    recoverable::is_cx1(value)
+}
+
+/// A note's public key at `index`, from the watch-only half of a branch.
+/// `index` is any u32 and never hardened. An unusable index is an error:
+/// use the next one.
+#[uniffi::export]
+pub fn derive_note_pubkey(
+    branch_pubkey_x_only_hex: &str,
+    chain_code_hex: &str,
+    index: u32,
+) -> FfiResult<String> {
+    Ok(hex::encode(recoverable::derive_note_pubkey(
+        &hex_array(branch_pubkey_x_only_hex, "a branch pubkey")?,
+        &hex_array(chain_code_hex, "a chain code")?,
+        index,
+    )?))
+}
+
+/// The secret key behind [`derive_note_pubkey`]. Bearer material.
+#[uniffi::export]
+pub fn derive_note_secret_key(
+    branch_private_key_hex: &str,
+    chain_code_hex: &str,
+    index: u32,
+) -> FfiResult<String> {
+    Ok(hex::encode(recoverable::derive_note_secret_key(
+        &hex_array(branch_private_key_hex, "a branch private key")?,
+        &hex_array(chain_code_hex, "a chain code")?,
+        index,
+    )?))
+}
+
+/// The raw 65-byte ownership signature, as hex. [`encode_ck1`] it for the
+/// wire; either way, it spends the note.
+#[uniffi::export]
+pub fn sign_note_ownership(secret_key_hex: &str) -> FfiResult<String> {
+    Ok(hex::encode(recoverable::sign_note_ownership(&hex_array(
+        secret_key_hex,
+        "a note secret key",
+    )?)?))
+}
+
+#[uniffi::export]
+pub fn recover_note_ownership_pubkey(signature_hex: &str) -> Option<String> {
+    let signature = hex::decode(signature_hex.trim()).ok()?;
+    recoverable::recover_note_ownership_pubkey(&signature).map(hex::encode)
+}
+
+/// The id a SERVICE files a note under: sha256(k1) for a secret, the
+/// recovered key for a `ck1`. Compare notes by this, never by k1.
+#[uniffi::export]
+pub fn note_id_of(k1: &str) -> Option<String> {
+    recoverable::note_id_of(k1)
+}
+
+/// What to look a note up by without disclosing it: the hash, or the `cp1`
+/// for a `ck1`. Pass it to [`build_note_info_url_by_hash`].
+#[uniffi::export]
+pub fn note_lookup_of(k1: &str) -> Option<String> {
+    recoverable::note_lookup_of(k1)
+}
+
+/// `m/139'/1'/d1/d2/d3/d4` for one mint, as a 64-byte hex node: the reference
+/// wallet's address branch. Bearer material - hand out its `cx1`.
+#[uniffi::export]
+pub fn derive_cash_address_node(root_hex: &str, host: &str) -> FfiResult<String> {
+    let root = cash::cash_node_from_hex(root_hex)?;
+    Ok(cash::cash_node_to_hex(
+        &recoverable::derive_cash_address_node(&root, host)?,
+    ))
+}
+
+#[uniffi::export]
+pub fn cash_node_to_cx1(node_hex: &str) -> FfiResult<FfiCx1> {
+    let node = cash::cash_node_from_hex(node_hex)?;
+    Ok(recoverable::cash_node_to_cx1(&node)?.into())
+}
+
+/// Not LUD-25: the cash seed of a Nostr identity key. Bearer material.
+#[uniffi::export]
+pub fn derive_nostr_cash_seed(secret_key_hex: &str) -> FfiResult<String> {
+    Ok(hex::encode(recoverable::derive_nostr_cash_seed(
+        &hex_array(secret_key_hex, "a Nostr secret key")?,
+    )))
+}
+
+/// Not LUD-25: one mint's address branch for a Nostr identity key, as a
+/// 64-byte hex node. Bearer material - hand out its `cx1`.
+#[uniffi::export]
+pub fn derive_nostr_address_node(secret_key_hex: &str, host: &str) -> FfiResult<String> {
+    Ok(cash::cash_node_to_hex(
+        &recoverable::derive_nostr_address_node(
+            &hex_array(secret_key_hex, "a Nostr secret key")?,
+            host,
+        )?,
+    ))
+}
+
 // ---- urls and notes ----
 
 /// The informational GET for a note named by its hash rather than its secret,
-/// so nothing spendable goes on the wire. What a restore walk uses.
+/// so nothing spendable goes on the wire. What a restore walk uses. `h` may be
+/// a Part 2 `cp1`, sent as `p`.
 #[uniffi::export]
 pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<String> {
     note::build_note_info_url_by_hash(withdraw_link, h)
@@ -502,7 +739,7 @@ pub fn invoice_request(pay_callback: &str, amount_msat: u64) -> FfiResult<FfiReq
 }
 
 /// Ask for a mint invoice, naming the note it will credit with
-/// `h = sha256(secret)`.
+/// `h = sha256(secret)`, or with a Part 2 `cp1`, sent as the comment alone.
 #[uniffi::export]
 pub fn mint_invoice_request_with_hash(
     pay_callback: &str,
@@ -554,6 +791,33 @@ pub fn split_request(
 #[uniffi::export]
 pub fn merge_request(callback: &str, k1s: Vec<String>, new_secret: &str) -> FfiResult<FfiRequest> {
     Ok(protocol::merge_request(callback, &k1s, new_secret)?.into())
+}
+
+/// Rotate into an output the caller already holds: a hash, or a Part 2 `cp1`
+/// (sent as `p1`). The request carries no secrets, because this crate never
+/// saw one - persist whatever stands behind `h` BEFORE the GET.
+#[uniffi::export]
+pub fn rotate_request_with_hash(callback: &str, k1: &str, h: &str) -> FfiResult<FfiRequest> {
+    Ok(protocol::rotate_request_with_hash(callback, k1, h)?.into())
+}
+
+/// As [`rotate_request_with_hash`], for a split: `h` and `h2` each go as a
+/// hash (`h`/`h2`) or a `cp1` (`p1`/`p2`).
+#[uniffi::export]
+pub fn split_request_with_hash(
+    callback: &str,
+    k1s: Vec<String>,
+    amount_msat: u64,
+    h: &str,
+    h2: &str,
+) -> FfiResult<FfiRequest> {
+    Ok(protocol::split_request_with_hash(callback, &k1s, amount_msat, h, h2)?.into())
+}
+
+/// As [`rotate_request_with_hash`], for a merge.
+#[uniffi::export]
+pub fn merge_request_with_hash(callback: &str, k1s: Vec<String>, h: &str) -> FfiResult<FfiRequest> {
+    Ok(protocol::merge_request_with_hash(callback, &k1s, h)?.into())
 }
 
 // ---- response parsing ----

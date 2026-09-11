@@ -5,6 +5,51 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### LUD-25 Part 2: notes keyed by a public key
+
+`recoverable` implements Part 2, with the TypeScript kit's names and
+semantics.
+
+- The four bech32m strings: `cp1` (a note's x-only key), `ck1` (the 65-byte
+  ownership signature that spends it), `cs1` (the mint's certificate) and
+  `cx1` (a watch-only branch). Fixed lengths, no 90-character limit, strict per
+  BIP-350: mixed case, a bech32 checksum, the wrong prefix or length and
+  non-zero padding are all refused. Decoders return `None` and never panic.
+- `derive_note_pubkey` (watch-only, from a `cx1`) and `derive_note_secret_key`:
+  the BIP-341-style tweak, through libsecp256k1's own x-only tweak functions.
+  `i` is any u32. A tweak at or above the curve order is an error, never
+  reduced.
+- `sign_note_ownership` / `recover_note_ownership_pubkey`, RFC6979 and low-S,
+  and `note_ownership_digest`.
+- `note_id_of` and `note_lookup_of`: the id a mint files either kind of note
+  under, and what to look one up by without disclosing it.
+- `derive_cash_address_node` and `cash_node_to_cx1`: the reference wallet's
+  `m/139'/1'/d1..d4` branch, not the draft text's `m/139'/d1..d4`.
+- `derive_nostr_cash_seed` / `derive_nostr_address_node`: an extension, not
+  LUD-25, rooting a branch in a Nostr identity key.
+- `cash::derive_cash_master`, the BIP-32 master on its own.
+
+The wire takes both kinds. A `ck1` goes anywhere a k1 does, including
+`resolve_note_input`, `note_signature_message` and `verify_note_signature`,
+which also takes a `cs1` as the signature. A `cp1` output goes as `p1`/`p2` in
+the `*_request_with_hash` builders, where a hash keeps `h`/`h2`; as the comment
+alone in `mint_invoice_request_with_hash`; and as `p` in
+`build_note_info_url_by_hash`. `verify_note_signature_hash` and the `*_for_hash`
+message and digest helpers check a certificate by key or hash, for a caller
+that holds the id but not the k1.
+
+All of it crosses the FFI, along with `derive_cash_child` and the three
+`*_request_with_hash` builders, which were not exported before and which a
+Part 2 output needs.
+
+`note_signature_message`, `note_signature_digest` and `verify_note_signature`
+now want a k1 that is 32 bytes of hex or a `ck1`, as the TypeScript kit does.
+Hex of any other length used to be hashed and signed over.
+
+Graded against `lnurlcash-conformance` 0.9.0's `part2.json` and
+`nostr-seed.json`: every field of every branch, note and certificate,
+including each `ck1` recovered to its note key and each `cs1` to the mint's.
+
 ### Three more fields off a mint address
 
 `parse_mint_address` reads `nodeUris`, `sunsetDate` and `outstandingNotesMsat`,

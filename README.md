@@ -184,6 +184,58 @@ cannot find its own position by scanning. The per-host counter is not secret —
 an index reveals nothing without the root — so back it up, and merge it
 upwards only.
 
+## Notes keyed by a public key (LUD-25 Part 2)
+
+A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`, and the
+mint only ever sees `pk`, written `cp1...`. To spend the note you hand over
+`ck1...`, a recoverable signature by `sk` over the fixed message `LNURLcash`,
+and the mint recovers `pk` from it to find the note. The mint's certificate,
+`cs1...`, is the same signature mints already make, over `hex(pk)` instead of a
+hash. So a recipient can check a note offline with nothing but its `ck1` and
+`cs1`.
+
+```rust
+use lnurlcash_core::cash::derive_cash_root;
+use lnurlcash_core::recoverable::*;
+use lnurlcash_core::verify_note_signature;
+
+let node = derive_cash_address_node(&derive_cash_root(&seed)?, "mint.example")?;
+let branch = cash_node_to_cx1(&node)?;
+let cx1 = encode_cx1(&branch.pubkey_x_only, &branch.chain_code); // watch-only
+
+let pk = derive_note_pubkey(&branch.pubkey_x_only, &branch.chain_code, i)?; // what a watcher derives
+let sk = derive_note_secret_key(&node.private_key, &node.chain_code, i)?;
+let ck1 = encode_ck1(&sign_note_ownership(&sk)?); // the bearer secret
+
+verify_note_signature(&ck1, amount_msat, &cs1, &mint_pubkey); // offline
+```
+
+The wire takes both kinds. A `ck1` goes anywhere a k1 does. A `cp1` goes
+anywhere an output does: `mint_invoice_request_with_hash` sends it as the
+comment alone, the `*_request_with_hash` builders send it as `p1`/`p2` where a
+hash keeps `h`/`h2`, and `build_note_info_url_by_hash` sends it as `p` where a
+hash keeps `h`. `note_id_of(k1)` is the id a mint files either kind under, and
+`note_lookup_of(k1)` what to look a note up by without disclosing it. One note
+has more than one valid `ck1` string, so compare notes by id, never by k1.
+
+Three things worth knowing:
+
+- **The branch path follows the reference wallet, not the draft's text.** It
+  is `m/139'/1'/d1/d2/d3/d4`, with the hashing key at `m/139'/1'/0`. The text
+  says `m/139'/d1..d4`, which is the Part 1 ladder's own node, and a wallet
+  following it finds none of lnurl-wallet's notes.
+- **A `cx1` links every note on its branch.** It spends nothing, but whoever
+  holds it can list every key on the branch and ask the mint about each one.
+- **`i` is any u32**, serialised as 4 bytes big-endian, never hardened. A tweak
+  at or above the curve order is an error rather than reduced: use the next
+  index.
+
+`derive_nostr_address_node(secret_key, host)` roots a branch in a Nostr
+identity key for a holder with no BIP-39 words:
+`HMAC-SHA256(key = secret key, msg = "LNURLcash/nostr-seed")`, then the same
+path. That one is an extension, not LUD-25; a mint sees an ordinary `cx1`
+either way.
+
 ## Amounts
 
 Integers in milli-satoshis, everywhere, with no exceptions.

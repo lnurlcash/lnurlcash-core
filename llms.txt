@@ -29,7 +29,7 @@ protocol::Policy { require_signatures }  default true: LUD-25 makes offline
   Merge} says what the response owes - a melt mints nothing and owes none.
 protocol::pay_request_request / invoice_request / verify_request + parse_*
 
-verify_note_signature(k1, amount_msat, sig_hex, mint_pubkey_hex) -> bool
+verify_note_signature(k1, amount_msat, sig_hex_or_cs1, mint_pubkey_hex) -> bool
 generate_note_secret() -> String    hash_k1(k1) -> Result<String>
 
 cash::derive_cash_root(seed) -> CashNode        LUD-25's scheme, BIP-32 m/139'
@@ -44,6 +44,8 @@ cash::derive_cash_secret(root, host, i) / cash::cash_secret_at(node, i)
 cash::cash_node_to_hex / from_hex     privateKey || chainCode, 64 bytes
 cash::derive_cash_child(node, raw_u32)          BIP-32 CKDpriv, for checking
   this crate against BIP-32's own vectors
+cash::derive_cash_master(seed) -> CashNode      the BIP-32 master, for walking
+  a path this crate does not name
 cash::CashSecretSource::{new, next_secret, next_index}
 secrets::derive_note_root / derive_note_secret  LEGACY pre-spec HMAC scheme.
   Do not mint under it; still scanned so old notes stay findable.
@@ -51,6 +53,40 @@ note::build_note_info_url_by_hash(withdraw_link, h) -> Option<String>
   the ?h= informational GET, so a restore walk keeps secrets off the wire.
   A rejection proves nothing: unsupported, unknown and BURNED are one answer.
   The persisted per-host counter is the real backup, not the scan.
+  h may be a Part 2 cp1, sent as p.
+
+LUD-25 Part 2 (recoverable::): a note keyed by a public key, spent by a
+recoverable signature
+encode_cp1/decode_cp1/is_cp1   note pubkey, 32-byte x-only, bech32m "cp"
+encode_ck1/decode_ck1/is_ck1   bearer secret, 65-byte r||s||recid, "ck"
+encode_cs1/decode_cs1/is_cs1   mint certificate over hex(pk), same layout, "cs"
+encode_cx1/decode_cx1/is_cx1   watch-only branch Cx1 { pubkey_x_only,
+  chain_code }, "cx". Decoders return None, never panic. No length limit;
+  all-uppercase accepted; mixed case, a bech32 (not bech32m) checksum, the
+  wrong hrp or length and non-zero padding refused (BIP-350)
+derive_cash_address_node(root, host) -> CashNode   m/139'/1'/d1..d4, hashing
+  key m/139'/1'/0. The REFERENCE WALLET's path, not the spec text's
+  m/139'/d1..d4 (that is the Part 1 ladder's node, and finds none of its notes)
+cash_node_to_cx1(node) -> Cx1
+derive_note_pubkey(P, chain_code, i) -> pk     watch-only, BIP-341 style
+  tweak; i any u32, 4-byte big-endian, never hardened. t >= n is an error,
+  never reduced: use the next index
+derive_note_secret_key(p, chain_code, i) -> sk   negates p first when P has
+  odd y
+sign_note_ownership(sk) -> [u8; 65]   RFC6979, low-S, over the fixed
+  "LNURLcash"; note_ownership_digest() is the digest
+recover_note_ownership_pubkey(sig) -> Option<pk>
+note_id_of(k1) -> Option<id>   sha256(k1) for a secret, the recovered key for
+  a ck1. One note has many valid ck1 strings: compare notes by this, not k1
+note_lookup_of(k1) -> Option<String>   the hash, or the cp1 for a ck1
+verify_note_signature also takes a ck1 as k1 and a cs1 as the signature;
+  verify_note_signature_hash(id, ..) checks a certificate by pk or hash
+Wire: a ck1 goes wherever a k1 does; a cp1 wherever an output does.
+  mint_invoice_request_with_hash: the comment alone (a hash also sends h).
+  rotate/split/merge_request_with_hash: p1/p2 for a cp1, h/h2 for a hash
+derive_nostr_cash_seed(sk) / derive_nostr_address_node(sk, host)   NOT
+  LUD-25: a branch from a Nostr identity key, via
+  HMAC-SHA256(key = sk, msg = "LNURLcash/nostr-seed"), then the address path
 resolve_note_input / resolve_mint_input / resolve_lnurl_input
 parse_mint_fee / apply_mint_fee / gross_up_for_mint_fee
 build_note_url / with_new_k1 / without_k1

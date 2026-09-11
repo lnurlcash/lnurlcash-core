@@ -227,13 +227,18 @@ impl Client {
     /// hash must answer as it would for an unknown `k1`, and so must one
     /// answering for a note that was burned, so only a positive answer is
     /// evidence of anything.
+    ///
+    /// `h` may be a Part 2 `cp1`, looked up as `p`;
+    /// [`crate::recoverable::note_lookup_of`] gives the right one for any k1.
     pub async fn fetch_note_info_by_hash(
         &self,
         withdraw_link: &str,
         h: &str,
     ) -> Result<protocol::NoteInfoByHash> {
         let url = crate::note::build_note_info_url_by_hash(withdraw_link, h).ok_or_else(|| {
-            Error::RequestRefused("a note hash lookup needs a URL and 32 bytes of hex".into())
+            Error::RequestRefused(
+                "a note lookup needs a URL and 32 bytes of hex or a cp1 key".into(),
+            )
         })?;
         let body = self.run(protocol::note_info_request(&url)?).await?;
         protocol::parse_note_info_by_hash(&body, self.config.policy)
