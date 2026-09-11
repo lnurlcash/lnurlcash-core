@@ -11,9 +11,10 @@ use lnurlcash_core::cash::{
     derive_cash_domain_node, derive_cash_root, derive_cash_secret,
 };
 use lnurlcash_core::protocol::{
-    melt_request, mint_invoice_request, mint_invoice_request_with_hash, parse_invoice,
-    parse_mutation, parse_pay_request, parse_verify, rotate_request, rotate_request_with_hash,
-    split_request, split_request_with_hash, MutationKind, MutationResponse, Policy, Request,
+    melt_request, mint_invoice_request, mint_invoice_request_with_hash, note_info_request,
+    parse_invoice, parse_mutation, parse_note_info, parse_pay_request, parse_verify,
+    rotate_request, rotate_request_with_hash, split_request, split_request_with_hash, MutationKind,
+    MutationResponse, Policy, Request,
 };
 use lnurlcash_core::recoverable::{
     cash_node_to_cx1, decode_ck1, decode_cp1, decode_cs1, decode_cx1, derive_cash_address_node,
@@ -616,6 +617,104 @@ fn response_vectors() {
         "too few response cases graded to mean anything"
     );
     assert!(cp1_graded >= 3, "0.10.0 carries three cp1 cases");
+}
+
+// ---- the informational GET ----
+//
+// withdraw-info.json: what a note's informational GET may answer, and what the
+// request carrying it may send. Through the same request builder and parser a
+// caller uses, which the client and the FFI both call, with the default
+// policy. Every case carries a JSON answer, so the parser sees all of them.
+
+fn assert_graded_fields(value: &Value, known: &[&str], what: &str) {
+    // a field this suite does not read is one nobody is grading
+    for key in value.as_object().expect("an object").keys() {
+        assert!(
+            known.contains(&key.as_str()),
+            "{what}: a field this suite does not grade: {key}"
+        );
+    }
+}
+
+fn query_pairs_of(url: &str) -> Vec<(String, String)> {
+    url::Url::parse(url)
+        .expect("a URL")
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
+}
+
+#[test]
+fn withdraw_info_vectors() {
+    let vectors = load("withdraw-info.json");
+    assert_eq!(vectors["version"], 1, "these tests read version 1");
+    assert_graded_fields(
+        &vectors,
+        &[
+            "version",
+            "spec",
+            "description",
+            "queriedUrl",
+            "requestMustNotSend",
+            "requestMustSendUnchanged",
+            "accepted",
+            "rejected",
+        ],
+        "withdraw-info.json",
+    );
+
+    let queried = str_of(&vectors, "queriedUrl");
+    let sent = query_pairs_of(&note_info_request(&queried).expect("builds").url);
+    let asked = query_pairs_of(&queried);
+    let values = |pairs: &[(String, String)], key: &str| -> Vec<String> {
+        pairs
+            .iter()
+            .filter(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .collect()
+    };
+    for key in vectors["requestMustNotSend"].as_array().expect("a list") {
+        let key = key.as_str().expect("a parameter name");
+        assert!(
+            values(&sent, key).is_empty(),
+            "sent {key}, which the SERVICE must never see"
+        );
+    }
+    for key in vectors["requestMustSendUnchanged"]
+        .as_array()
+        .expect("a list")
+    {
+        let key = key.as_str().expect("a parameter name");
+        assert_eq!(
+            values(&sent, key),
+            values(&asked, key),
+            "{key} did not go out as queried"
+        );
+    }
+
+    let accepted = vectors["accepted"].as_array().expect("accepted");
+    for case in accepted {
+        let name = str_of(case, "name");
+        assert_graded_fields(case, &["name", "body", "maxWithdrawable", "why"], &name);
+        let expected = case["maxWithdrawable"].as_u64().expect("maxWithdrawable");
+        let info = parse_note_info(&case["body"], &queried, Policy::default())
+            .unwrap_or_else(|err| panic!("{name}: refused: {err:?}"));
+        assert_eq!(info.max_withdrawable, expected, "{name}");
+    }
+    let rejected = vectors["rejected"].as_array().expect("rejected");
+    for case in rejected {
+        let name = str_of(case, "name");
+        assert_graded_fields(case, &["name", "body", "why"], &name);
+        let result = parse_note_info(&case["body"], &queried, Policy::default());
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "{name}: {result:?}, want a protocol error"
+        );
+    }
+    assert!(
+        !accepted.is_empty() && !rejected.is_empty(),
+        "no cases graded"
+    );
 }
 
 // ---- derivation ----
