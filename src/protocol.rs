@@ -11,6 +11,7 @@ use crate::bolt11::decode_bolt11_amount_msat;
 use crate::errors::{classify_note_error, Error, Result};
 use crate::fees::{parse_mint_fee, MintFee};
 use crate::note::note_k1;
+use crate::recoverable::{is_cp1, note_id_of};
 use crate::secrets::{hash_k1, is_preimage};
 use crate::urls::is_allowed_service_url;
 
@@ -337,7 +338,7 @@ pub fn parse_note_info(
     // with is non-compliant - or the note was rotated by somebody else, which
     // matters more.
     if let Some(queried) = note_k1(queried_url) {
-        if k1.to_ascii_lowercase() != queried {
+        if !same_note(&k1, &queried) {
             return Err(Error::Protocol(
                 "the service echoed back a different k1 than was queried - the note may have been redeemed elsewhere, or the service isn't spec-compliant".into(),
             ));
@@ -364,6 +365,19 @@ pub fn parse_note_info(
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
     })
+}
+
+/// Whether two k1s name one note. A Part 1 secret has one spelling, but a
+/// Part 2 note has more than one valid `ck1`: anyone can flip a signature to
+/// its high-S twin, and a signer drawing another nonce makes another. So a
+/// SERVICE that echoes a different `ck1` recovering to the same key has named
+/// the same note, while one recovering to any other key has not. A k1 with no
+/// note id at all still has to come back as the same string.
+fn same_note(a: &str, b: &str) -> bool {
+    if a.trim().eq_ignore_ascii_case(b.trim()) {
+        return true;
+    }
+    matches!((note_id_of(a), note_id_of(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// The same response, for a lookup that named the note by its hash.
@@ -484,10 +498,37 @@ pub fn melt_request(callback: &str, k1: &str, pr: &str) -> Result<Request> {
     )?))
 }
 
+// ---- the output-naming variants ----
+//
+// The mutation behind rotate, split and merge, taking an output the caller
+// already holds rather than generating one: what a hardware wallet drives,
+// and how a note moves to a Part 2 key.
+//
+// A k1 input may be a Part 1 secret or a Part 2 `ck1`; the SERVICE tells them
+// apart by shape, and both pass through untouched. An output may be a hash or
+// a Part 2 `cp1`. LUD-25 renamed the callback's `h`/`h2` to `p1`/`p2`: a hash
+// keeps the old names, which every mint that ever took one accepts, and a key
+// goes as `p1`/`p2`, which only a Part 2 mint takes anyway. Decided per
+// value, never by a version flag, which is the rule lnurl-wallet and the
+// TypeScript kit follow too.
+
+fn output_param(
+    value: &str,
+    hash_name: &'static str,
+    key_name: &'static str,
+) -> (&'static str, String) {
+    let name = if is_cp1(&value.trim().to_ascii_lowercase()) {
+        key_name
+    } else {
+        hash_name
+    };
+    (name, value.to_string())
+}
+
 pub fn rotate_request_with_hash(callback: &str, k1: &str, h: &str) -> Result<Request> {
     Ok(Request::plain(callback_url(
         callback,
-        &[("k1", k1.to_string()), ("h", h.to_string())],
+        &[("k1", k1.to_string()), output_param(h, "h", "p1")],
     )?))
 }
 
@@ -500,14 +541,14 @@ pub fn split_request_with_hash(
 ) -> Result<Request> {
     let mut params: Vec<(&str, String)> = k1s.iter().map(|k1| ("k1", k1.clone())).collect();
     params.push(("amount", amount_msat.to_string()));
-    params.push(("h", h.to_string()));
-    params.push(("h2", h2.to_string()));
+    params.push(output_param(h, "h", "p1"));
+    params.push(output_param(h2, "h2", "p2"));
     Ok(Request::plain(callback_url(callback, &params)?))
 }
 
 pub fn merge_request_with_hash(callback: &str, k1s: &[String], h: &str) -> Result<Request> {
     let mut params: Vec<(&str, String)> = k1s.iter().map(|k1| ("k1", k1.clone())).collect();
-    params.push(("h", h.to_string()));
+    params.push(output_param(h, "h", "p1"));
     Ok(Request::plain(callback_url(callback, &params)?))
 }
 
@@ -674,17 +715,26 @@ pub fn invoice_request(pay_callback: &str, amount_msat: u64) -> Result<Request> 
 /// point of the current draft: a preimage propagates to every routing node
 /// that forwards the payment, and a note keyed by one is a note they can all
 /// spend.
+///
+/// `h` may instead be a Part 2 `cp1`, minting the note to a key. That goes as
+/// the comment alone: `h` is a hash-only extension, and a mint may refuse a
+/// key under it.
 pub fn mint_invoice_request_with_hash(
     pay_callback: &str,
     amount_msat: u64,
     h: &str,
 ) -> Result<Request> {
+    // lowercase for the same reason a note's k1 is normalised: it is bytes,
+    // not text, and a SERVICE filing notes under what it was given should be
+    // given one spelling of it
     let h = h.trim().to_ascii_lowercase();
+    let key = is_cp1(&h);
     // Refused here rather than sent, so a WALLET never pays for a quote the
     // SERVICE was always going to reject.
-    if !is_preimage(&h) {
+    if !key && !is_preimage(&h) {
         return Err(Error::RequestRefused(
-            "an output commitment must be 32 bytes of hex - no invoice was requested".into(),
+            "an output commitment must be 32 bytes of hex or a cp1 key - no invoice was requested"
+                .into(),
         ));
     }
     let mut url = url::Url::parse(pay_callback)
@@ -693,7 +743,9 @@ pub fn mint_invoice_request_with_hash(
         let mut serializer = url.query_pairs_mut();
         serializer.append_pair("amount", &amount_msat.to_string());
         serializer.append_pair("comment", &h);
-        serializer.append_pair("h", &h);
+        if !key {
+            serializer.append_pair("h", &h);
+        }
     }
     Ok(Request::plain(url.to_string()))
 }

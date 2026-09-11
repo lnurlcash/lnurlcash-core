@@ -2,8 +2,10 @@
 //! states what the protocol is - the vectors do, and this suite only binds them
 //! to the crate's functions.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
+use hmac::{Hmac, Mac};
 use lnurlcash_core::cash::{
     cash_domain_indices, cash_node_from_hex, cash_node_to_hex, cash_secret_at, derive_cash_child,
     derive_cash_domain_node, derive_cash_root, derive_cash_secret,
@@ -13,15 +15,24 @@ use lnurlcash_core::protocol::{
     mint_invoice_request, mint_invoice_request_with_hash, parse_invoice, parse_pay_request,
     parse_verify,
 };
+use lnurlcash_core::recoverable::{
+    cash_node_to_cx1, decode_ck1, decode_cp1, decode_cs1, decode_cx1, derive_cash_address_node,
+    derive_nostr_address_node, derive_nostr_cash_seed, derive_note_pubkey, derive_note_secret_key,
+    encode_ck1, encode_cp1, encode_cs1, encode_cx1, is_ck1, is_cp1, is_cs1, is_cx1,
+    note_ownership_digest, recover_note_ownership_pubkey, sign_note_ownership,
+    NOSTR_CASH_SEED_LABEL,
+};
 use lnurlcash_core::secrets::{derive_note_root, derive_note_secret};
 use lnurlcash_core::{
     apply_mint_fee, build_note_url, decode_bolt11_amount_msat, format_fee_percent,
     from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url, is_bolt11_invoice,
-    is_preimage, lightning_address_username, mint_address_url, note_declared_amount, note_k1,
-    note_signature, note_signature_digest, note_signature_message, parse_mint_fee,
-    resolve_lnurl_input, resolve_mint_input, resolve_note_input, same_invoice, to_bech32_lnurl,
-    verify_note_signature, with_new_k1, without_k1, MintFee,
+    is_preimage, lightning_address_username, mint_address_url, note_declared_amount, note_id_of,
+    note_k1, note_lookup_of, note_signature, note_signature_digest, note_signature_digest_for_hash,
+    note_signature_message, note_signature_message_for_hash, parse_mint_fee, resolve_lnurl_input,
+    resolve_mint_input, resolve_note_input, same_invoice, to_bech32_lnurl, verify_note_signature,
+    verify_note_signature_hash, with_new_k1, without_k1, MintFee,
 };
+use secp256k1::{ecdsa, Message, Parity, PublicKey, Secp256k1, SecretKey};
 use serde_json::Value;
 
 fn vectors_dir() -> PathBuf {
@@ -584,5 +595,429 @@ fn legacy_derivation_vectors() {
             str_of(case, "noteId"),
             "{name}"
         );
+    }
+}
+
+// ---- LUD-25 Part 2 ----
+//
+// part2.json pins the reference wallet's address branch, the per-note key
+// tweak, ownership signatures, mint certificates and the four bech32m
+// strings. Every field is graded on every branch and note: a wallet that
+// disagrees with one of them cannot find, spend or check a note that another
+// implementation of the same seed made.
+
+fn bytes32(value: &Value, key: &str) -> [u8; 32] {
+    hex::decode(str_of(value, key))
+        .expect("hex")
+        .try_into()
+        .unwrap_or_else(|_| panic!("{key} is 32 bytes"))
+}
+
+fn index_of(note: &Value) -> u32 {
+    u32::try_from(note["index"].as_u64().expect("index")).expect("a note index is a u32")
+}
+
+/// BIP-39's seed from its mnemonic: PBKDF2-HMAC-SHA512, 2048 rounds, salt
+/// "mnemonic" and no passphrase. Only here so the vectors' `mnemonic` is
+/// graded against their `seedHex`: the crate itself takes raw seed bytes and
+/// deliberately carries no wordlist.
+fn bip39_seed(mnemonic: &str) -> Vec<u8> {
+    let prf = Hmac::<sha2::Sha512>::new_from_slice(mnemonic.as_bytes())
+        .expect("HMAC takes a key of any length");
+    let mut first = prf.clone();
+    first.update(b"mnemonic");
+    first.update(&1u32.to_be_bytes());
+    let mut round = first.finalize().into_bytes();
+    let mut seed = round;
+    for _ in 1..2048 {
+        let mut next = prf.clone();
+        next.update(&round);
+        round = next.finalize().into_bytes();
+        for (out, byte) in seed.iter_mut().zip(round.iter()) {
+            *out ^= byte;
+        }
+    }
+    seed.to_vec()
+}
+
+fn parity_of(private_key: &[u8; 32]) -> &'static str {
+    let key = SecretKey::from_slice(private_key).expect("a valid key");
+    match key.x_only_public_key(&Secp256k1::signing_only()).1 {
+        Parity::Even => "even",
+        Parity::Odd => "odd",
+    }
+}
+
+fn is_low_s(signature: &[u8; 65]) -> bool {
+    let original = ecdsa::Signature::from_compact(&signature[..64]).expect("r || s");
+    let mut normalised = original;
+    normalised.normalize_s();
+    normalised == original
+}
+
+#[test]
+fn part2_branch_vectors() {
+    let vectors = load("part2.json");
+
+    // The conventions this crate implements, named in the file, so a vector
+    // regenerated under a different one fails here and not as a byte mismatch
+    // three levels down.
+    let conventions = &vectors["conventions"];
+    assert_eq!(
+        conventions["addressBranch"].as_str(),
+        Some("m/139'/1'/d1/d2/d3/d4")
+    );
+    assert_eq!(conventions["hashingKey"].as_str(), Some("m/139'/1'/0"));
+    assert_eq!(conventions["ownershipMessage"].as_str(), Some("LNURLcash"));
+    assert_eq!(
+        conventions["certificateMessage"].as_str(),
+        Some("LNURLcash:<amount_msat>:<hex(pk)>")
+    );
+    assert_eq!(
+        hex::encode(note_ownership_digest()),
+        str_of(conventions, "ownershipDigest")
+    );
+
+    let branches = vectors["branches"].as_array().expect("branches");
+    // An odd branch is the only thing that exercises the negation, and the
+    // top of the u32 range is where a hardened-index mistake would show.
+    assert!(branches.iter().any(|b| b["branchParity"] == "odd"));
+    assert!(branches.iter().any(|b| b["branchParity"] == "even"));
+    let indices: Vec<u32> = branches[0]["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .map(index_of)
+        .collect();
+    assert!(indices.contains(&0x8000_0000) && indices.contains(&u32::MAX));
+
+    for branch in branches {
+        let host = str_of(branch, "host");
+        let seed = hex::decode(str_of(branch, "seedHex")).expect("seedHex is hex");
+        assert_eq!(
+            bip39_seed(&str_of(branch, "mnemonic")),
+            seed,
+            "{host}: mnemonic"
+        );
+
+        let root = derive_cash_root(&seed).expect("root");
+        assert_eq!(
+            cash_node_to_hex(&root),
+            str_of(branch, "cashRoot"),
+            "{host}"
+        );
+        // the hashing key is m/139'/1'/0, so the four levels hang off m/139'/1'
+        let purpose = derive_cash_child(&root, 1 + 0x8000_0000).expect("m/139'/1'");
+        let domain_indices: Vec<u32> = branch["domainIndices"]
+            .as_array()
+            .expect("domainIndices")
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().expect("index")).expect("u32"))
+            .collect();
+        assert_eq!(
+            cash_domain_indices(&purpose, &host)
+                .expect("indices")
+                .to_vec(),
+            domain_indices,
+            "{host}"
+        );
+
+        let node = derive_cash_address_node(&root, &host).expect("address node");
+        assert_eq!(
+            cash_node_to_hex(&node),
+            str_of(branch, "addressNode"),
+            "{host}"
+        );
+        assert_eq!(
+            parity_of(&node.private_key),
+            str_of(branch, "branchParity"),
+            "{host}"
+        );
+
+        let cx1 = cash_node_to_cx1(&node).expect("cx1");
+        assert_eq!(
+            hex::encode(cx1.pubkey_x_only),
+            str_of(branch, "branchPubkey"),
+            "{host}"
+        );
+        assert_eq!(
+            hex::encode(cx1.chain_code),
+            str_of(branch, "chainCode"),
+            "{host}"
+        );
+        assert_eq!(
+            encode_cx1(&cx1.pubkey_x_only, &cx1.chain_code),
+            str_of(branch, "cx1"),
+            "{host}"
+        );
+        // a watcher starts from the string, never the node
+        let watched = decode_cx1(&str_of(branch, "cx1")).expect("cx1 decodes");
+        assert_eq!(watched, cx1, "{host}");
+
+        for note in branch["notes"].as_array().expect("notes") {
+            let index = index_of(note);
+            let at = format!("{host} #{index}");
+
+            let pubkey = derive_note_pubkey(&watched.pubkey_x_only, &watched.chain_code, index)
+                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            assert_eq!(hex::encode(pubkey), str_of(note, "notePubkey"), "{at}");
+            assert_eq!(encode_cp1(&pubkey), str_of(note, "cp1"), "{at}");
+            assert_eq!(decode_cp1(&str_of(note, "cp1")), Some(pubkey), "{at}");
+
+            let secret = derive_note_secret_key(&node.private_key, &node.chain_code, index)
+                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            assert_eq!(hex::encode(secret), str_of(note, "noteSecretKey"), "{at}");
+
+            // RFC6979: the same key reproduces the same ck1, byte for byte
+            let signature = sign_note_ownership(&secret).expect("signs");
+            assert_eq!(
+                hex::encode(signature),
+                str_of(note, "ownershipSignature"),
+                "{at}"
+            );
+            assert!(signature[64] <= 3, "{at}: recovery id");
+            assert!(is_low_s(&signature), "{at}: high S");
+            let ck1 = str_of(note, "ck1");
+            assert_eq!(encode_ck1(&signature), ck1, "{at}");
+            assert_eq!(decode_ck1(&ck1), Some(signature), "{at}");
+
+            // the SERVICE's side: the ck1 alone gives the key the note is
+            // filed under, which is also the one the watcher derived
+            assert_eq!(
+                recover_note_ownership_pubkey(&signature),
+                Some(pubkey),
+                "{at}"
+            );
+            assert_eq!(note_id_of(&ck1), Some(str_of(note, "notePubkey")), "{at}");
+            assert_eq!(note_lookup_of(&ck1), Some(str_of(note, "cp1")), "{at}");
+        }
+    }
+}
+
+#[test]
+fn part2_certificate_vectors() {
+    let vectors = load("part2.json");
+    let mint = &vectors["mint"];
+    let mint_pubkey = str_of(mint, "mintPubkey");
+    let mint_key = SecretKey::from_slice(&bytes32(mint, "privateKey")).expect("the mint's key");
+    let secp = Secp256k1::new();
+    assert_eq!(
+        hex::encode(PublicKey::from_secret_key(&secp, &mint_key).serialize()),
+        mint_pubkey,
+        "the mint's key pair"
+    );
+
+    // Every note in the file by key, so each certificate is checked the way a
+    // recipient checks one: from the note's ck1 and nothing else.
+    let ck1_of: HashMap<String, String> = vectors["branches"]
+        .as_array()
+        .expect("branches")
+        .iter()
+        .flat_map(|branch| branch["notes"].as_array().expect("notes"))
+        .map(|note| (str_of(note, "notePubkey"), str_of(note, "ck1")))
+        .collect();
+
+    let certificates = vectors["certificates"].as_array().expect("certificates");
+    assert!(!certificates.is_empty());
+    for certificate in certificates {
+        let pubkey = str_of(certificate, "notePubkey");
+        let amount = certificate["amountMsat"].as_u64().expect("amountMsat");
+        let at = format!("{amount} msat");
+        let message = str_of(certificate, "message");
+        let digest = str_of(certificate, "digest");
+
+        assert_eq!(
+            note_signature_message_for_hash(&pubkey, amount),
+            message,
+            "{at}"
+        );
+        assert_eq!(
+            hex::encode(note_signature_digest_for_hash(&pubkey, amount)),
+            digest,
+            "{at}"
+        );
+        let ck1 = ck1_of
+            .get(&pubkey)
+            .unwrap_or_else(|| panic!("{at}: the certificate names a note in the file"));
+        assert_eq!(
+            note_signature_message(ck1, amount).as_deref(),
+            Some(message.as_str()),
+            "{at}"
+        );
+        assert_eq!(
+            note_signature_digest(ck1, amount).map(hex::encode),
+            Some(digest.clone()),
+            "{at}"
+        );
+
+        let signature_hex = str_of(certificate, "signature");
+        let signature: [u8; 65] = hex::decode(&signature_hex)
+            .expect("hex")
+            .try_into()
+            .expect("65 bytes");
+        let cs1 = str_of(certificate, "cs1");
+        assert_eq!(encode_cs1(&signature), cs1, "{at}");
+        assert_eq!(decode_cs1(&cs1), Some(signature), "{at}");
+
+        // RFC6979 on the mint's side too: its key over the digest reproduces
+        // the certificate
+        let digest_bytes: [u8; 32] = hex::decode(&digest)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        let (recovery, compact) = secp
+            .sign_ecdsa_recoverable(&Message::from_digest(digest_bytes), &mint_key)
+            .serialize_compact();
+        assert_eq!(&signature[..64], &compact[..], "{at}");
+        assert_eq!(i32::from(signature[64]), recovery.to_i32(), "{at}");
+
+        // Each recovers to the mint's key: by the note's key, in either
+        // spelling of the signature, and from the ck1 alone...
+        assert!(
+            verify_note_signature_hash(&pubkey, amount, &signature_hex, &mint_pubkey),
+            "{at}"
+        );
+        assert!(
+            verify_note_signature_hash(&pubkey, amount, &cs1, &mint_pubkey),
+            "{at}"
+        );
+        assert!(
+            verify_note_signature(ck1, amount, &cs1, &mint_pubkey),
+            "{at}"
+        );
+        assert!(
+            verify_note_signature(ck1, amount, &signature_hex, &mint_pubkey),
+            "{at}"
+        );
+        // ...and to nothing it does not cover
+        assert!(
+            !verify_note_signature(ck1, amount + 1, &cs1, &mint_pubkey),
+            "{at}: another amount"
+        );
+        let other = ck1_of
+            .iter()
+            .find(|(key, _)| **key != pubkey)
+            .map(|(_, other)| other)
+            .expect("another note");
+        assert!(
+            !verify_note_signature(other, amount, &cs1, &mint_pubkey),
+            "{at}: another note"
+        );
+    }
+}
+
+#[test]
+fn part2_string_vectors() {
+    let vectors = load("part2.json");
+
+    // the payload as hex, or None, for each of the four types
+    let decode = |kind: &str, value: &str| -> Option<String> {
+        let (decoded, is) = match kind {
+            "cp1" => (decode_cp1(value).map(hex::encode), is_cp1(value)),
+            "ck1" => (decode_ck1(value).map(hex::encode), is_ck1(value)),
+            "cs1" => (decode_cs1(value).map(hex::encode), is_cs1(value)),
+            "cx1" => (
+                decode_cx1(value).map(|cx1| {
+                    format!(
+                        "{}{}",
+                        hex::encode(cx1.pubkey_x_only),
+                        hex::encode(cx1.chain_code)
+                    )
+                }),
+                is_cx1(value),
+            ),
+            other => panic!("a string type this crate does not know: {other}"),
+        };
+        assert_eq!(
+            decoded.is_some(),
+            is,
+            "{kind} {value}: is_ and decode_ disagree"
+        );
+        decoded
+    };
+
+    for case in vectors["valid"].as_array().expect("valid") {
+        let why = str_of(case, "why");
+        assert_eq!(
+            decode(&str_of(case, "type"), &str_of(case, "value")),
+            Some(str_of(case, "bytes")),
+            "{why}"
+        );
+    }
+    let invalid = vectors["invalid"].as_array().expect("invalid");
+    assert!(!invalid.is_empty());
+    for case in invalid {
+        let why = str_of(case, "why");
+        assert!(!why.is_empty(), "an invalid string without a reason");
+        assert_eq!(
+            decode(&str_of(case, "type"), &str_of(case, "value")),
+            None,
+            "{why}"
+        );
+    }
+}
+
+/// An extension, not LUD-25: a Part 2 branch rooted in a Nostr identity key.
+#[test]
+fn nostr_seed_vectors() {
+    let vectors = load("nostr-seed.json");
+    assert_eq!(vectors["extension"].as_bool(), Some(true));
+    assert_eq!(vectors["label"].as_str(), Some(NOSTR_CASH_SEED_LABEL));
+
+    let cases = vectors["cases"].as_array().expect("cases");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let host = str_of(case, "host");
+        let identity = bytes32(case, "identity");
+
+        assert_eq!(
+            hex::encode(derive_nostr_cash_seed(&identity)),
+            str_of(case, "seed"),
+            "{host}"
+        );
+        // the npub a lightning address on this branch belongs to
+        let identity_key = SecretKey::from_slice(&identity).expect("a valid identity");
+        assert_eq!(
+            hex::encode(
+                identity_key
+                    .x_only_public_key(&Secp256k1::signing_only())
+                    .0
+                    .serialize()
+            ),
+            str_of(case, "identityPubkey"),
+            "{host}"
+        );
+
+        let node = derive_nostr_address_node(&identity, &host).expect("address node");
+        assert_eq!(
+            cash_node_to_hex(&node),
+            str_of(case, "addressNode"),
+            "{host}"
+        );
+        let cx1 = cash_node_to_cx1(&node).expect("cx1");
+        assert_eq!(
+            encode_cx1(&cx1.pubkey_x_only, &cx1.chain_code),
+            str_of(case, "cx1"),
+            "{host}"
+        );
+
+        for note in case["notes"].as_array().expect("notes") {
+            let index = index_of(note);
+            let at = format!("{host} #{index}");
+            let secret = derive_note_secret_key(&node.private_key, &node.chain_code, index)
+                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            assert_eq!(hex::encode(secret), str_of(note, "noteSecretKey"), "{at}");
+            let pubkey = derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, index)
+                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            assert_eq!(hex::encode(pubkey), str_of(note, "notePubkey"), "{at}");
+            assert_eq!(encode_cp1(&pubkey), str_of(note, "cp1"), "{at}");
+            let ck1 = encode_ck1(&sign_note_ownership(&secret).expect("signs"));
+            assert_eq!(ck1, str_of(note, "ck1"), "{at}");
+            assert_eq!(
+                note_id_of(&str_of(note, "ck1")),
+                Some(str_of(note, "notePubkey")),
+                "{at}: ck1 recovery"
+            );
+        }
     }
 }

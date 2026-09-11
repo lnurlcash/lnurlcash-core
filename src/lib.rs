@@ -22,6 +22,10 @@
 //! callback?k1=X&k1=Y&h=<sha256(Z)>       merge
 //! ```
 //!
+//! A LUD-25 Part 2 note is keyed by a public key instead: its k1 is a `ck1`
+//! signature, and its output a `cp1` key sent as `p1`/`p2`. See
+//! [`recoverable`].
+//!
 //! # What this crate is for
 //!
 //! It exists so there is exactly one audited implementation of the parts that
@@ -58,6 +62,7 @@ uniffi::setup_scaffolding!();
 pub mod fees;
 pub mod note;
 pub mod protocol;
+pub mod recoverable;
 pub mod secrets;
 pub mod signature;
 pub mod urls;
@@ -76,8 +81,12 @@ pub use protocol::{
     InvoiceResult, MintAddressInfo, MutationResponse, PayRequestInfo, Request, VerifyResult,
     WithdrawRequestInfo, MINT_COMMENT_LENGTH,
 };
+pub use recoverable::{note_id_of, note_lookup_of};
 pub use secrets::{generate_note_secret, hash_k1, is_preimage};
-pub use signature::{note_signature_digest, note_signature_message, verify_note_signature};
+pub use signature::{
+    note_signature_digest, note_signature_digest_for_hash, note_signature_message,
+    note_signature_message_for_hash, verify_note_signature, verify_note_signature_hash,
+};
 pub use urls::{
     from_bech32_lnurl, from_lud17, is_allowed_service_url, is_bech32_lnurl, is_lightning_address,
     lightning_address_username, mint_address_url, resolve_lnurl_input, resolve_mint_input,

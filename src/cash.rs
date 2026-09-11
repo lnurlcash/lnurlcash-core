@@ -26,6 +26,10 @@
 //! `lnurlcash-note-v1`) predates this section and is now the legacy scheme:
 //! still derived, still scanned on restore forever, so nothing already minted
 //! goes missing, but no longer what a new wallet should mint under.
+//!
+//! Part 2's address branch, `m/139'/1'/d1/d2/d3/d4`, is built from the same
+//! steps but hangs off its own node beside this ladder: see
+//! [`crate::recoverable`].
 
 use hmac::{Hmac, Mac};
 use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
@@ -121,7 +125,10 @@ pub fn derive_cash_child(node: &CashNode, index: u32) -> Result<CashNode> {
     })
 }
 
-fn master_from(seed: &[u8]) -> Result<CashNode> {
+/// The BIP-32 master node of a seed. Public beside [`derive_cash_child`] for
+/// the same reason: a consumer walking a path this crate does not name starts
+/// here.
+pub fn derive_cash_master(seed: &[u8]) -> Result<CashNode> {
     if seed.len() < 16 || seed.len() > 64 {
         return Err(Error::Protocol(format!(
             "a BIP-32 seed must be 16 to 64 bytes, not {}",
@@ -149,7 +156,7 @@ fn master_from(seed: &[u8]) -> Result<CashNode> {
 /// reference wallet feeds in, but nothing here depends on BIP39 - which is
 /// also what keeps a mnemonic wordlist out of every consumer's binary.
 pub fn derive_cash_root(seed: &[u8]) -> Result<CashNode> {
-    derive_cash_child(&master_from(seed)?, CASH_PURPOSE + HARDENED)
+    derive_cash_child(&derive_cash_master(seed)?, CASH_PURPOSE + HARDENED)
 }
 
 /// The four raw uint32 levels this mint's subtree hangs off.
