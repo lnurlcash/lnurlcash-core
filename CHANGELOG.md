@@ -38,6 +38,13 @@ alone in `mint_invoice_request_with_hash`; and as `p` in
 message and digest helpers check a certificate by key or hash, for a caller
 that holds the id but not the k1.
 
+`parse_note_info` checks the echoed k1 by note id rather than as a string.
+One note has more than one valid `ck1` (anyone can flip one to its high-S
+twin), so a SERVICE echoing a different `ck1` that recovers to the same key has
+named the same note; one recovering to any other key is still refused, and a k1
+with no id still has to match exactly. The TypeScript kit compares strings
+here; the Go kit compares ids, as this now does.
+
 All of it crosses the FFI, along with `derive_cash_child` and the three
 `*_request_with_hash` builders, which were not exported before and which a
 Part 2 output needs.

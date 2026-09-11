@@ -1,19 +1,25 @@
 //! The LUD-25 Part 2 wire: a `ck1` wherever a k1 goes, a `cp1` wherever an
-//! output goes. Pure request building, so no mint is needed, and every value
-//! is made here from fixed keys with the crate's own functions: the bytes
+//! output goes. Pure request building and response parsing, so no mint is
+//! needed. Most values are made here from fixed keys with the crate's own
+//! functions; the echo check starts from a conformance `ck1`. The bytes
 //! themselves are graded in vectors.rs.
+
+use std::path::PathBuf;
 
 use lnurlcash_core::note::build_note_info_url_by_hash;
 use lnurlcash_core::protocol::{
     melt_request, merge_request_with_hash, mint_invoice_request_with_hash, note_info_request,
-    rotate_request_with_hash, split_request_with_hash,
+    parse_note_info, rotate_request_with_hash, split_request_with_hash, Policy,
 };
 use lnurlcash_core::recoverable::{
-    encode_ck1, encode_cp1, encode_cs1, recover_note_ownership_pubkey, sign_note_ownership,
+    decode_ck1, encode_ck1, encode_cp1, encode_cs1, recover_note_ownership_pubkey,
+    sign_note_ownership,
 };
 use lnurlcash_core::{
     hash_k1, note_id_of, note_lookup_of, note_signature_message, resolve_note_input, Error,
 };
+use secp256k1::SecretKey;
+use serde_json::{json, Value};
 use url::Url;
 
 const CB: &str = "https://mint.example/w/cb";
@@ -147,6 +153,74 @@ fn a_part2_note_is_looked_up_by_p_and_a_hash_by_h() {
         build_note_info_url_by_hash("https://mint.example/w", &a.ck1),
         None
     );
+}
+
+// ---- the echo on an informational GET ----
+
+fn part2_vectors() -> Value {
+    let dir = match std::env::var("LNURLCASH_CONFORMANCE") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate has a parent directory")
+            .join("lnurlcash-conformance"),
+    };
+    let path = dir.join("vectors").join("part2.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("could not read {}: {err}", path.display()));
+    serde_json::from_str(&text).expect("vector file is valid JSON")
+}
+
+/// The same signature with s replaced by n - s and the recovery id flipped.
+/// Anyone holding a `ck1` can make this, and it recovers to the same key.
+fn high_s_twin(signature: &[u8; 65]) -> [u8; 65] {
+    let s = SecretKey::from_slice(&signature[32..64]).expect("s is in [1, n)");
+    let mut twin = *signature;
+    twin[32..64].copy_from_slice(&s.negate().secret_bytes());
+    twin[64] ^= 1;
+    twin
+}
+
+#[test]
+fn an_echoed_ck1_is_the_same_note_when_it_recovers_to_the_same_key() {
+    let vectors = part2_vectors();
+    let notes = vectors["branches"][0]["notes"].as_array().expect("notes");
+    let ours = notes[0]["ck1"].as_str().expect("ck1").to_string();
+    let other = notes[1]["ck1"].as_str().expect("ck1").to_string();
+    let twin = encode_ck1(&high_s_twin(&decode_ck1(&ours).expect("a vector ck1")));
+    assert_ne!(twin, ours, "the twin is a different string");
+
+    let url = format!("https://mint.example/w?k1={ours}&amount=21000");
+    let answer = |echoed: &str| {
+        parse_note_info(
+            &json!({
+                "tag": "withdrawRequest",
+                "callback": CB,
+                "k1": echoed,
+                "minWithdrawable": 21_000,
+                "maxWithdrawable": 21_000,
+                "mintPubkey": vectors["mint"]["mintPubkey"],
+            }),
+            &url,
+            Policy::default(),
+        )
+    };
+
+    // the same note, however the SERVICE spells its ck1
+    for echoed in [ours.clone(), ours.to_ascii_uppercase(), twin.clone()] {
+        let info = answer(&echoed).unwrap_or_else(|err| panic!("{echoed}: {err}"));
+        assert_eq!(note_id_of(&info.k1), note_id_of(&ours), "{echoed}");
+    }
+
+    // a different note, the note's id in place of its k1, or nothing that is
+    // a note at all, is still refused
+    let id_of_ours = note_id_of(&ours).expect("an id");
+    for echoed in [other, k1(), id_of_ours, "zz".into()] {
+        assert!(
+            matches!(answer(&echoed), Err(Error::Protocol(_))),
+            "{echoed} must be refused"
+        );
+    }
 }
 
 // ---- mutations ----

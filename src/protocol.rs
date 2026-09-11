@@ -11,7 +11,7 @@ use crate::bolt11::decode_bolt11_amount_msat;
 use crate::errors::{classify_note_error, Error, Result};
 use crate::fees::{parse_mint_fee, MintFee};
 use crate::note::note_k1;
-use crate::recoverable::is_cp1;
+use crate::recoverable::{is_cp1, note_id_of};
 use crate::secrets::{hash_k1, is_preimage};
 use crate::urls::is_allowed_service_url;
 
@@ -338,7 +338,7 @@ pub fn parse_note_info(
     // with is non-compliant - or the note was rotated by somebody else, which
     // matters more.
     if let Some(queried) = note_k1(queried_url) {
-        if k1.to_ascii_lowercase() != queried {
+        if !same_note(&k1, &queried) {
             return Err(Error::Protocol(
                 "the service echoed back a different k1 than was queried - the note may have been redeemed elsewhere, or the service isn't spec-compliant".into(),
             ));
@@ -365,6 +365,19 @@ pub fn parse_note_info(
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
     })
+}
+
+/// Whether two k1s name one note. A Part 1 secret has one spelling, but a
+/// Part 2 note has more than one valid `ck1`: anyone can flip a signature to
+/// its high-S twin, and a signer drawing another nonce makes another. So a
+/// SERVICE that echoes a different `ck1` recovering to the same key has named
+/// the same note, while one recovering to any other key has not. A k1 with no
+/// note id at all still has to come back as the same string.
+fn same_note(a: &str, b: &str) -> bool {
+    if a.trim().eq_ignore_ascii_case(b.trim()) {
+        return true;
+    }
+    matches!((note_id_of(a), note_id_of(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// The same response, for a lookup that named the note by its hash.
