@@ -5,6 +5,15 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### The informational GET, graded
+
+- Graded against `lnurlcash-conformance` 0.10.0's `withdraw-info.json`, every
+  case, through `note_info_request` and `parse_note_info`, which the client
+  and the FFI both call, including the request it builds: `sig` stays behind
+  and `k1` goes out unchanged. Every case already passed: `as_u64` refuses a
+  fractional `maxWithdrawable` and one past `u64::MAX` rather than rounding
+  either. No change to the FFI surface.
+
 ### A plain note is unsigned
 
 LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing to attest
