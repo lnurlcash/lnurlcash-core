@@ -14,7 +14,8 @@
 //!
 //! 1. build a request, keeping `newSecrets` somewhere durable FIRST
 //! 2. GET `request.url` with your own client
-//! 3. hand the response body back to the matching `parse` function
+//! 3. hand the response body back to the matching `parse` function, with the
+//!    request's `newSecrets` and `outputs` for a mutation
 //! 4. if the GET failed, or parsing says the outcome is unknown, the secrets
 //!    you saved in step 1 may be the only copy of the money
 
@@ -29,6 +30,12 @@ pub struct FfiRequest {
     /// BEFORE performing the GET: if the answer is lost, they may be the only
     /// copies of notes the service has already minted.
     pub new_secrets: Vec<String>,
+    /// The outputs a rotate, split or merge named, exactly as sent:
+    /// `[output]` for a rotate or merge, `[output, change]` for a split, and
+    /// empty for every other request. Hand them to [`parse_mutation`] with
+    /// the response: a `cp1` output is owed a certificate and a hash output is
+    /// not, and this is how the parser knows which it asked for. Not secret.
+    pub outputs: Vec<String>,
 }
 
 impl From<protocol::Request> for FfiRequest {
@@ -36,6 +43,48 @@ impl From<protocol::Request> for FfiRequest {
         FfiRequest {
             url: request.url,
             new_secrets: request.new_secrets,
+            outputs: request.outputs,
+        }
+    }
+}
+
+/// What the parsers insist a service does, as [`protocol::Policy`]. The
+/// defaults are the spec's: build one with no arguments unless you mean to
+/// change something.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct FfiPolicy {
+    /// Also demand the old Part 1 signature over a plain hash output. Off by
+    /// default: LUD-25 Part 2 certifies `cp1` notes only, so a plain note is
+    /// unsigned by design. A `cp1` output is owed its `cs1` certificate
+    /// whatever this says.
+    #[uniffi(default = false)]
+    pub require_signatures: bool,
+    /// Refuse a withdrawRequest that publishes no valid `mintPubkey`. On by
+    /// default; off only for a Part 1-only service that publishes none.
+    #[uniffi(default = true)]
+    pub require_mint_pubkey: bool,
+}
+
+impl Default for FfiPolicy {
+    fn default() -> Self {
+        protocol::Policy::default().into()
+    }
+}
+
+impl From<protocol::Policy> for FfiPolicy {
+    fn from(policy: protocol::Policy) -> Self {
+        FfiPolicy {
+            require_signatures: policy.require_signatures,
+            require_mint_pubkey: policy.require_mint_pubkey,
+        }
+    }
+}
+
+impl From<FfiPolicy> for protocol::Policy {
+    fn from(policy: FfiPolicy) -> Self {
+        protocol::Policy {
+            require_signatures: policy.require_signatures,
+            require_mint_pubkey: policy.require_mint_pubkey,
         }
     }
 }
@@ -69,10 +118,12 @@ pub enum LnurlcashError {
         new_secrets: Vec<String>,
     },
 
-    /// The mutation LANDED and the SERVICE returned no signature over it.
-    /// LUD-25 requires one, so this is a non-conforming SERVICE - but the note
-    /// exists at the hash the wallet disclosed, and `new_secrets` is the only
-    /// key to it. Persist them before deciding anything else.
+    /// The mutation LANDED and the SERVICE returned no certificate for a
+    /// `cp1` output, which LUD-25 Part 2 requires - or no signature over a
+    /// hash output when the policy asked for one. A non-conforming SERVICE,
+    /// but the note exists, and `new_secrets` is the only key to it. Persist
+    /// them before deciding anything else. Empty when the caller named the
+    /// output: this library never saw what stands behind it.
     Unverifiable {
         detail: String,
         new_secrets: Vec<String>,
@@ -222,7 +273,8 @@ pub struct FfiVerify {
 }
 
 /// Which mutation a response is being read as. A melt mints nothing and so
-/// owes no signature; a split mints two notes and owes one over each.
+/// owes nothing; a split mints two notes, and each is owed what its kind is
+/// owed.
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum FfiMutationKind {
     Melt,
@@ -244,7 +296,11 @@ impl From<FfiMutationKind> for protocol::MutationKind {
 
 #[derive(Debug, uniffi::Record)]
 pub struct FfiMutation {
+    /// Always present for a `cp1` output: its `cs1` certificate. For a plain
+    /// hash output null, unless the service still issues the old Part 1
+    /// signature over the hash.
     pub signature: Option<String>,
+    /// The same for a split's change.
     pub change_signature: Option<String>,
     pub pr: Option<String>,
     pub verify: Option<String>,
@@ -822,19 +878,18 @@ pub fn merge_request_with_hash(callback: &str, k1s: Vec<String>, h: &str) -> Ffi
 
 // ---- response parsing ----
 
-/// `require_signatures` mirrors [`protocol::Policy`]: leave it true unless the
-/// SERVICE predates LUD-25's mandatory offline verification, because a note
-/// with no key to check it against is one whoever receives it must take on
-/// faith.
+/// Only `policy.require_mint_pubkey` matters here. Leave it on unless the
+/// service is a Part 1-only mint that publishes no `mintPubkey`, because a
+/// note with no key to check it against is one whoever receives it must take
+/// on faith.
 #[uniffi::export]
 pub fn parse_note_info(
     body: &str,
     queried_url: &str,
-    require_signatures: bool,
+    policy: FfiPolicy,
 ) -> FfiResult<FfiWithdrawInfo> {
     let value = parse_body(body)?;
-    let info =
-        protocol::parse_note_info(&value, queried_url, protocol::Policy { require_signatures })?;
+    let info = protocol::parse_note_info(&value, queried_url, policy.into())?;
     Ok(FfiWithdrawInfo {
         callback: info.callback,
         k1: info.k1,
@@ -917,12 +972,20 @@ pub fn parse_verify(body: &str) -> FfiResult<FfiVerify> {
 /// Pass the secrets the request carried: if the outcome turns out to be
 /// unknown, they come back attached to the error, so nothing can lose them
 /// between the call and the catch.
+///
+/// Pass the request's `outputs` too. A `cp1` output that comes back without
+/// its certificate is [`LnurlcashError::Unverifiable`] whatever the policy
+/// says; a plain hash output comes back with its signature null, unless
+/// `policy.require_signatures` asks for one. An output missing from
+/// `outputs` is read as a hash, so leaving them out quietly drops the `cp1`
+/// check.
 #[uniffi::export]
 pub fn parse_mutation(
     body: &str,
     new_secrets: Vec<String>,
     kind: FfiMutationKind,
-    require_signatures: bool,
+    outputs: Vec<String>,
+    policy: FfiPolicy,
 ) -> FfiResult<FfiMutation> {
     let value = match parse_body(body) {
         Ok(value) => value,
@@ -934,7 +997,7 @@ pub fn parse_mutation(
         }
         Err(other) => return Err(other),
     };
-    match protocol::parse_mutation(&value, kind.into(), protocol::Policy { require_signatures }) {
+    match protocol::parse_mutation(&value, kind.into(), &outputs, policy.into()) {
         Ok(response) => Ok(FfiMutation {
             signature: response.signature,
             change_signature: response.change_signature,

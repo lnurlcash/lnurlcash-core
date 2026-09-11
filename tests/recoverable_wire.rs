@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use lnurlcash_core::note::build_note_info_url_by_hash;
 use lnurlcash_core::protocol::{
     melt_request, merge_request_with_hash, mint_invoice_request_with_hash, note_info_request,
-    parse_note_info, rotate_request_with_hash, split_request_with_hash, Policy,
+    parse_mutation, parse_note_info, rotate_request, rotate_request_with_hash,
+    split_request_with_hash, MutationKind, Policy,
 };
 use lnurlcash_core::recoverable::{
     decode_ck1, encode_ck1, encode_cp1, encode_cs1, recover_note_ownership_pubkey,
@@ -275,6 +276,146 @@ fn a_merge_takes_a_part1_secret_and_a_part2_note_together() {
         .url;
     assert_eq!(all(&url, "k1"), vec![k1(), a.ck1]);
     assert_eq!(one(&url, "p1"), Some(c.cp1));
+}
+
+// ---- what a response owes each output ----
+//
+// LUD-25 Part 2 certifies cp1 notes only. A cp1 output is owed its cs1, in
+// `sig` or in `sig2` for a split's change, whatever the policy says; a hash
+// output is a plain note, unsigned by design. The request records which it
+// named, and the parser reads that back rather than being told separately.
+
+#[test]
+fn a_request_records_the_outputs_it_named() {
+    let (a, b) = (part2_note(0x11), part2_note(0x22));
+    let hash = hash_k1(&k1()).expect("hash");
+    assert_eq!(
+        rotate_request_with_hash(CB, &a.ck1, &b.cp1)
+            .expect("builds")
+            .outputs,
+        vec![b.cp1.clone()]
+    );
+    assert_eq!(
+        split_request_with_hash(CB, &[k1()], 5_000, &hash, &b.cp1)
+            .expect("builds")
+            .outputs,
+        vec![hash.clone(), b.cp1.clone()]
+    );
+    assert_eq!(
+        merge_request_with_hash(CB, &[k1(), a.ck1.clone()], &b.cp1)
+            .expect("builds")
+            .outputs,
+        vec![b.cp1]
+    );
+    // a generated output is the hash of the fresh secret, never the secret
+    let fresh = "22".repeat(32);
+    let rotated = rotate_request(CB, &k1(), &fresh).expect("builds");
+    assert_eq!(rotated.outputs, vec![hash_k1(&fresh).expect("hash")]);
+    assert_eq!(rotated.new_secrets, vec![fresh]);
+    // and nothing else names an output
+    assert!(melt_request(CB, &a.ck1, "lnbc210n1pjqrstuvwxyz")
+        .expect("builds")
+        .outputs
+        .is_empty());
+    assert!(note_info_request("https://mint.example/w?k1=ab")
+        .expect("builds")
+        .outputs
+        .is_empty());
+}
+
+#[test]
+fn an_uncertified_cp1_output_is_unverifiable_whatever_the_policy() {
+    let (a, b) = (part2_note(0x11), part2_note(0x22));
+    let hash = hash_k1(&k1()).expect("hash");
+    let strict = Policy {
+        require_signatures: true,
+        ..Policy::default()
+    };
+    // the default has signatures off, which is the case that matters
+    assert!(!Policy::default().require_signatures);
+    for policy in [Policy::default(), strict] {
+        let cases = [
+            (
+                rotate_request_with_hash(CB, &a.ck1, &b.cp1),
+                MutationKind::Rotate,
+            ),
+            // spelt in capitals, which is still one cp1
+            (
+                rotate_request_with_hash(CB, &a.ck1, &b.cp1.to_ascii_uppercase()),
+                MutationKind::Rotate,
+            ),
+            (
+                merge_request_with_hash(CB, &[k1(), a.ck1.clone()], &b.cp1),
+                MutationKind::Merge,
+            ),
+            (
+                split_request_with_hash(CB, std::slice::from_ref(&a.ck1), 5_000, &b.cp1, &hash),
+                MutationKind::Split,
+            ),
+        ];
+        for (request, kind) in cases {
+            let request = request.expect("builds");
+            let err = parse_mutation(&json!({"status": "OK"}), kind, &request.outputs, policy)
+                .expect_err("a cp1 output is owed its certificate");
+            assert!(
+                matches!(err, Error::Unverifiable { .. }),
+                "{kind:?} {policy:?}: {err:?}"
+            );
+            assert!(err.to_string().contains("cs1"), "{kind:?}: {err}");
+            // The caller named the output, so this crate never saw what stands
+            // behind it and there is nothing to carry out. The note exists
+            // all the same, at the key the caller persisted before the call.
+            assert!(err
+                .with_secrets(request.new_secrets)
+                .new_secrets()
+                .is_empty());
+        }
+    }
+
+    // certified, the same rotate is fine, and the certificate comes back
+    let request = rotate_request_with_hash(CB, &a.ck1, &b.cp1).expect("builds");
+    let response = parse_mutation(
+        &json!({"status": "OK", "sig": b.cs1_shaped}),
+        MutationKind::Rotate,
+        &request.outputs,
+        Policy::default(),
+    )
+    .expect("a certified cp1 output");
+    assert_eq!(response.signature, Some(b.cs1_shaped));
+}
+
+#[test]
+fn a_cp1_change_is_owed_its_certificate_in_sig2() {
+    let b = part2_note(0x22);
+    let hash = hash_k1(&k1()).expect("hash");
+    let request = split_request_with_hash(CB, &[k1()], 5_000, &hash, &b.cp1).expect("builds");
+
+    // the first output is a plain note: unsigned, or carrying a Part 1
+    // signature, and neither excuses the change
+    for body in [
+        json!({"status": "OK"}),
+        json!({"status": "OK", "sig": "ab".repeat(65)}),
+    ] {
+        let err = parse_mutation(
+            &body,
+            MutationKind::Split,
+            &request.outputs,
+            Policy::default(),
+        )
+        .expect_err("a cp1 change is owed its certificate");
+        assert!(matches!(err, Error::Unverifiable { .. }), "{body}: {err:?}");
+        assert!(err.to_string().contains("split's change"), "{body}: {err}");
+    }
+
+    let response = parse_mutation(
+        &json!({"status": "OK", "sig2": b.cs1_shaped}),
+        MutationKind::Split,
+        &request.outputs,
+        Policy::default(),
+    )
+    .expect("the change is certified and the plain note owes nothing");
+    assert_eq!(response.signature, None);
+    assert_eq!(response.change_signature, Some(b.cs1_shaped));
 }
 
 #[test]

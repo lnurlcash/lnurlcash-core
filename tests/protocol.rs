@@ -5,13 +5,16 @@
 
 #![cfg(feature = "client")]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use lnurlcash_core::client::{Client, ClientConfig, NoteFate};
 use lnurlcash_core::protocol::Policy;
 use lnurlcash_core::{build_note_url, hash_k1, verify_note_signature, Error};
+use serde_json::Value;
 
 struct MockMint {
     url: String,
@@ -624,26 +627,58 @@ async fn reads_an_advertised_fee() {
     assert_eq!(fee.fee_ppm, 2000);
 }
 
-// ---- mandatory offline verification ----
+// ---- a plain note is unsigned ----
 
-/// LUD-25 stopped treating a note signature as optional, so a SERVICE that
-/// issues none is non-conforming rather than merely basic. The refusal has to
-/// be the loud kind - but the rotate LANDED, and the fresh secret is the only
-/// key to the note it minted, so the error carries it out. Refusing without it
-/// would be this crate destroying real money to make a point about
-/// conformance.
+/// LUD-25 Part 2 certifies cp1 notes only: a hash has nothing to attest to
+/// without disclosing the secret behind it. So a mint answering a plain
+/// rotate or split with a bare OK is following the spec, and the notes come
+/// back unsigned - which is what a plain note is.
 #[tokio::test]
-async fn an_unsigned_rotate_is_refused_without_losing_the_note() {
+async fn an_unsigned_plain_note_is_the_spec_not_a_fault() {
     let mint = mint_or_skip!(&["--signatures=false"]);
     let client = Client::new();
+    let k1 = secret(29);
+    mint.credit(&k1, 21000).await;
+
+    let info = client.fetch_note_info(&mint.note_url(&k1)).await.unwrap();
+    let rotated = client.rotate_note(&info.callback, &k1).await.unwrap();
+    assert!(rotated.signature.is_none());
+    assert_eq!(
+        mint.note_state(&rotated.k1).await.as_deref(),
+        Some("outstanding")
+    );
+
+    let split = client
+        .split_note(&info.callback, std::slice::from_ref(&rotated.k1), 5000)
+        .await
+        .unwrap();
+    assert!(split.signature.is_none() && split.change_signature.is_none());
+    assert_eq!(
+        mint.note_state(&split.change).await.as_deref(),
+        Some("outstanding")
+    );
+}
+
+/// A caller who still wants the old Part 1 signature over the hash can ask
+/// for it. The refusal has to be the loud kind - but the rotate LANDED, and
+/// the fresh secret is the only key to the note it minted, so the error
+/// carries it out. Refusing without it would be this crate destroying real
+/// money to make a point about a signature.
+#[tokio::test]
+async fn requiring_signatures_refuses_an_unsigned_rotate_without_losing_the_note() {
+    let mint = mint_or_skip!(&["--signatures=false"]);
+    let client = Client::with_config(ClientConfig {
+        policy: Policy {
+            require_signatures: true,
+            ..Policy::default()
+        },
+        ..ClientConfig::default()
+    });
     let k1 = secret(28);
     mint.credit(&k1, 21000).await;
 
     let err = client.rotate_note(&mint.callback(), &k1).await.unwrap_err();
-    assert!(
-        matches!(err, lnurlcash_core::errors::Error::Unverifiable { .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, Error::Unverifiable { .. }), "got {err:?}");
     let kept = err.new_secrets().to_vec();
     assert_eq!(kept.len(), 1);
     // the note the caller was refused is real, outstanding, and reachable with
@@ -654,26 +689,158 @@ async fn an_unsigned_rotate_is_refused_without_losing_the_note() {
     );
 }
 
-/// The same mint, for a caller who has decided to deal with it anyway. One
-/// setting, and the note comes back unsigned - which is what it is.
-#[tokio::test]
-async fn an_unsigned_service_still_works_when_the_caller_opts_out() {
-    let mint = mint_or_skip!(&["--signatures=false"]);
-    let client = Client::with_config(ClientConfig {
-        policy: Policy {
-            require_signatures: false,
-        },
-        ..ClientConfig::default()
-    });
-    let k1 = secret(29);
-    mint.credit(&k1, 21000).await;
+// ---- classifying a response, from the vectors ----
 
-    let info = client.fetch_note_info(&mint.note_url(&k1)).await.unwrap();
-    let rotated = client.rotate_note(&info.callback, &k1).await.unwrap();
-    assert!(rotated.signature.is_none());
-    assert_eq!(
-        mint.note_state(&rotated.k1).await.as_deref(),
-        Some("outstanding")
+enum Canned {
+    Answer(u16, String),
+    Drop,
+    Stall,
+}
+
+/// A one-shot HTTP service on loopback that answers the first request it is
+/// sent the way a responses.json case says: with a status and a body, by
+/// dropping the connection, or by never answering at all.
+fn canned_service(canned: Canned) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let url = format!("http://{}", listener.local_addr().expect("an address"));
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        // the whole request head first, so the client is past sending before
+        // anything happens to the connection
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+            }
+        }
+        match canned {
+            Canned::Answer(status, body) => {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} Canned\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+            Canned::Drop => drop(stream),
+            Canned::Stall => std::thread::sleep(Duration::from_secs(5)),
+        }
+    });
+    url
+}
+
+/// responses.json through the client's own transport, a 500, a dropped
+/// connection and a timeout included. Every case whose outputs are plain
+/// notes, which is every note this client mints; the cp1 cases need an output
+/// the caller names, and tests/vectors.rs grades those through the parser.
+/// Retries are off, so one case is one request - the replay has its own tests.
+#[tokio::test]
+async fn response_vectors_through_the_client() {
+    let path = conformance_dir().join("vectors").join("responses.json");
+    if !path.exists() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no vectors at {} - CI must grade them, never skip",
+            path.display()
+        );
+        eprintln!("skipping: no vectors at {}", path.display());
+        return;
+    }
+    let text = std::fs::read_to_string(&path).expect("read responses.json");
+    let vectors: Value = serde_json::from_str(&text).expect("valid JSON");
+
+    let mut graded = 0;
+    for case in vectors["cases"].as_array().expect("cases") {
+        let name = case["name"].as_str().expect("name");
+        if !case["output"].is_null() || !case["change"].is_null() {
+            continue;
+        }
+        let (canned, timeout) = if case["transportError"] == true {
+            (Canned::Drop, Duration::from_secs(10))
+        } else if case["timeout"] == true {
+            (Canned::Stall, Duration::from_millis(200))
+        } else {
+            let status = u16::try_from(case["http"].as_u64().expect("http")).expect("a status");
+            let body = match case.get("body") {
+                Some(body) => body.to_string(),
+                None => case["bodyRaw"].as_str().expect("bodyRaw").to_string(),
+            };
+            (Canned::Answer(status, body), Duration::from_secs(10))
+        };
+        let client = Client::with_config(ClientConfig {
+            timeout,
+            mutation_retries: 0,
+            ..ClientConfig::default()
+        });
+        let callback = format!("{}/w/cb", canned_service(canned));
+        let k1 = secret(60);
+
+        // what came back, and how many fresh secrets the request carried
+        let (result, minted) = match case["op"].as_str().expect("op") {
+            "melt" => (
+                client
+                    .melt_note(&callback, &k1, "lnbc210n1pjq")
+                    .await
+                    .map(|_| (None, None)),
+                0,
+            ),
+            "split" => (
+                client
+                    .split_note(&callback, std::slice::from_ref(&k1), 5000)
+                    .await
+                    .map(|split| (split.signature, split.change_signature)),
+                2,
+            ),
+            "mutation" => (
+                client
+                    .rotate_note(&callback, &k1)
+                    .await
+                    .map(|rotated| (rotated.signature, None)),
+                1,
+            ),
+            other => panic!("{name}: an op this suite does not know: {other}"),
+        };
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(Error::Unverifiable { .. }) => "unverifiable",
+            Err(Error::NotePending) => "pending",
+            Err(Error::NoteSpent { .. }) => "spent",
+            Err(Error::NoteUnknown { .. }) => "unknown",
+            Err(Error::ServiceRejected(_)) => "error",
+            Err(Error::Ambiguous { .. }) => "ambiguous",
+            Err(other) => panic!("{name}: not an outcome responses.json names: {other:?}"),
+        };
+        assert_eq!(
+            outcome,
+            case["expect"].as_str().expect("expect"),
+            "{name}: {result:?}"
+        );
+        match result {
+            Ok((signature, change_signature)) => {
+                assert_eq!(signature.as_deref(), case["signature"].as_str(), "{name}");
+                assert_eq!(
+                    change_signature.as_deref(),
+                    case["changeSignature"].as_str(),
+                    "{name}"
+                );
+            }
+            Err(err) if matches!(outcome, "ambiguous" | "unverifiable") => {
+                assert_eq!(
+                    err.new_secrets().len(),
+                    minted,
+                    "{name}: the fresh secrets must survive"
+                );
+            }
+            Err(_) => {}
+        }
+        graded += 1;
+    }
+    assert!(
+        graded > 10,
+        "too few response cases graded to mean anything"
     );
 }
 

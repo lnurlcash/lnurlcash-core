@@ -16,17 +16,24 @@ protocol directly, and nothing async crosses the FFI boundary.
 
 ## Core API
 
-protocol::note_info_request(url) -> Request { url, new_secrets }
+protocol::note_info_request(url) -> Request { url, new_secrets, outputs }
 protocol::parse_note_info(&Value, queried_url, Policy) -> WithdrawRequestInfo
 protocol::rotate_request(callback, k1, new_secret) -> Request
 protocol::split_request(callback, k1s, amount_msat, new_secret, change_secret) -> Request
 protocol::merge_request(callback, k1s, new_secret) -> Request
 protocol::melt_request(callback, k1, bolt11) -> Request
-protocol::parse_mutation(&Value, MutationKind, Policy) -> MutationResponse
-protocol::Policy { require_signatures }  default true: LUD-25 makes offline
-  verification mandatory, so a withdrawRequest with no mintPubkey and a
-  mutation with no sig are both refused. MutationKind::{Melt,Rotate,Split,
-  Merge} says what the response owes - a melt mints nothing and owes none.
+protocol::parse_mutation(&Value, MutationKind, &request.outputs, Policy)
+  -> MutationResponse. outputs = what the rotate/split/merge named, recorded
+  on the Request: [output], or [output, change] for a split. A cp1 output is
+  owed its cs1 in sig (sig2 for a split's change) ALWAYS, whatever the
+  policy; without it the mutation is Unverifiable. A plain hash output is
+  unsigned by design (LUD-25 Part 2 certifies cp1 notes only): signature
+  None, no error. A missing output reads as a hash. MutationKind::{Melt,
+  Rotate,Split,Merge} - a melt mints nothing and owes none.
+protocol::Policy { require_signatures, require_mint_pubkey }  defaults false
+  and true. require_signatures also demands the old Part 1 sig over a hash
+  output. require_mint_pubkey refuses a withdrawRequest with no valid
+  mintPubkey; off only for a Part 1-only mint. Build with ..Policy::default().
 protocol::pay_request_request / invoice_request / verify_request + parse_*
 
 verify_note_signature(k1, amount_msat, sig_hex_or_cs1, mint_pubkey_hex) -> bool
@@ -109,10 +116,13 @@ Error::NoteSpent { reason, new_secrets }    authoritative at the info GET.
   an ALREADY-APPLIED mutation looks like - read new_secrets before believing
 Error::NoteUnknown { reason, new_secrets }  service does not recognise it
 Error::Ambiguous { message, new_secrets }   outcome UNKNOWN
-Error::Unverifiable { message, new_secrets }  the mutation LANDED and came
-  back unsigned. The note is REAL - persist new_secrets, then report the mint
+Error::Unverifiable { message, new_secrets }  the mutation LANDED and a cp1
+  output came back with no cs1 (or a hash output unsigned under
+  require_signatures). The note is REAL - persist new_secrets (empty from a
+  *_with_hash call: the caller holds that key), then report the mint
 Error::Protocol         a non-mutating response did not match the spec,
-  which includes a withdrawRequest publishing no mintPubkey
+  which includes a withdrawRequest publishing no mintPubkey (unless
+  require_mint_pubkey is off)
 
 err.is_ambiguous() and err.is_definitive() are the two questions worth asking.
 err.new_secrets() carries the secrets out of any error that could describe a
@@ -148,6 +158,13 @@ client::ClientConfig { policy, mutation_retries, .. }
 
 cargo run --features bindgen --bin uniffi-bindgen -- generate \
   --library target/release/liblnurlcash_core.dylib --language kotlin --out-dir bindings
+
+FfiRequest { url, new_secrets, outputs }
+FfiPolicy { require_signatures = false, require_mint_pubkey = true }
+parse_note_info(body, queried_url, FfiPolicy) -> FfiWithdrawInfo
+parse_mutation(body, new_secrets, kind, outputs, FfiPolicy) -> FfiMutation
+  pass request.newSecrets AND request.outputs back: without outputs a cp1
+  output is read as a hash and its missing certificate goes unnoticed
 
 ## Conformance
 

@@ -41,7 +41,9 @@ pub struct ClientConfig {
     /// caller takes on by doing so.
     pub secret_source: fn() -> String,
     /// What this client insists a SERVICE does. See [`Policy`]; the default
-    /// requires the offline verification LUD-25 makes mandatory.
+    /// requires a `mintPubkey` on every note and accepts a plain note
+    /// unsigned, which is what LUD-25 Part 2 makes it. The notes this client
+    /// generates are all plain ones.
     pub policy: Policy,
     /// How many times to re-send a rotate, split or merge whose outcome the
     /// transport lost.
@@ -198,7 +200,7 @@ impl Client {
         for _ in 0..=attempts {
             let outcome = async {
                 let body = self.run(request.clone()).await?;
-                protocol::parse_mutation(&body, kind, self.config.policy)
+                protocol::parse_mutation(&body, kind, &request.outputs, self.config.policy)
             }
             .await;
             match outcome {

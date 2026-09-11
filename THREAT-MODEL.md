@@ -59,9 +59,12 @@ http to loopback or `.onion`. A `data:` URL carrying withdrawRequest JSON
 would otherwise mint a self-contained fake note that verifies against
 nothing.
 
-**A service that inflates a note.** With offline verification configured, the
-signature commits to the amount. A service reporting more than it signed
-fails verification, without the holder contacting anyone.
+**A service that inflates a note.** A `cp1` note's certificate commits to the
+amount, and so does a Part 1 signature where a mint still issues one. A
+service reporting more than it signed fails verification, without the holder
+contacting anyone. A plain hash note carries no signature by design since the
+LUD-25 Part 2 rewrite, so this defence belongs to the `cp1` note: hold one
+where it matters.
 
 **A service that swaps your note.** The informational GET checks that the
 echoed `k1` is the one queried. A different one means either a non-compliant

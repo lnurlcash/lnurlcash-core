@@ -5,6 +5,62 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### A plain note is unsigned
+
+LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing to attest
+to without disclosing the secret behind it. The reference mint and moneyer now
+answer a rotate, split or merge to a hash output with a bare
+`{"status":"OK"}`, and this crate follows, as the TypeScript kit now does.
+
+- `Policy::require_signatures` now defaults to **false**. A hash output that
+  comes back unsigned is the spec, not a fault: `signature` (and
+  `change_signature`) is `None`, and no `Error::Unverifiable` is raised. Set it
+  true to keep demanding the old Part 1 signature over the hash.
+- A `cp1` output is owed its `cs1` certificate whatever the policy says. A
+  rotate, split or merge naming a `cp1` output (sent as `p1`, or `p2` for a
+  split's change) that comes back without `sig` (or `sig2` for the change) is
+  `Error::Unverifiable`, carrying the request's fresh secrets as before: none
+  for the `*_request_with_hash` builders, which never saw what stands behind
+  the output.
+- A signature that is present on a hash output is returned as before. A mint
+  still issuing the Part 1 signature over the hash is fine wherever it
+  verifies.
+- New `Policy::require_mint_pubkey`, default true, takes over the
+  `withdrawRequest` `mintPubkey` check that `require_signatures` used to carry,
+  in `parse_note_info` and `parse_note_info_by_hash`. A Part 1-only mint that
+  publishes no `mintPubkey` is admitted with it set false.
+
+To tell a `cp1` output from a hash, `parse_mutation` now takes the outputs the
+request named: `parse_mutation(body, kind, &request.outputs, policy)`. Every
+request records them on the new `Request::outputs` (`[output]` for a rotate or
+merge, `[output, change]` for a split, empty for anything else), so a caller
+hands back what it built rather than restating it. An output missing from the
+list is read as a hash.
+
+Over the FFI:
+
+- `FfiRequest` gains `outputs`.
+- New record `FfiPolicy { require_signatures, require_mint_pubkey }`, mirroring
+  `Policy` and defaulting to false and true in the generated bindings.
+- `parse_note_info(body, queried_url, policy: FfiPolicy)` replaces the trailing
+  `require_signatures: bool`.
+- `parse_mutation(body, new_secrets, kind, outputs, policy: FfiPolicy)`
+  replaces `parse_mutation(body, new_secrets, kind, require_signatures)`.
+
+Both calls change type rather than changing what a boolean means, so a
+binding still passing the old flag fails to compile instead of quietly reading
+it as the new option.
+
+Graded against `lnurlcash-conformance` 0.10.0's `responses.json`, every case,
+with the three `cp1` ones driven by their `output` or `change` field. Each case
+with a JSON answer goes through the parser; each plain-note case also goes
+through the client's own transport, a 500, a dropped connection and a timeout
+included.
+
+If you relied on the default to refuse unsigned plain notes, set
+`require_signatures: true`. If you only ever wanted verifiable notes, hold
+`cp1` notes, which are the only kind the spec now makes verifiable.
+
 ### LUD-25 Part 2: notes keyed by a public key
 
 `recoverable` implements Part 2, with the TypeScript kit's names and
@@ -104,19 +160,19 @@ and the adversarial mock mint.
 
 ### Design notes
 
-**Offline verification is mandatory, and this crate insists on it.** LUD-25
-stopped treating a note signature as optional: a SERVICE MUST publish
-`mintPubkey` and MUST sign every note a rotate, split or merge mints. So
+**A note owed a certificate is refused without one, and only that note.** A
+`cp1` note is owed its `cs1`, so `parse_mutation` raises `Error::Unverifiable`
+when a SERVICE confirms a mutation to one without it, whatever the policy. A
+plain hash note is unsigned by design and passes, unless
+`Policy::require_signatures` asks for the old Part 1 signature. And
 `parse_note_info` refuses a `withdrawRequest` publishing no `mintPubkey`, or
-one that is not a 33-byte compressed secp256k1 key, and `parse_mutation`
-raises `Error::Unverifiable` when a SERVICE confirms a mutation without
-signing it. `Policy { require_signatures: false }` opts out for a SERVICE that
-predates the requirement.
+one that is not a 33-byte compressed secp256k1 key, unless
+`Policy::require_mint_pubkey` is off.
 
 That error carries the fresh secrets, and the reason matters: `status` was OK,
-so the mutation LANDED. The note exists at the hash the wallet disclosed and
-that secret is the only key to it, so enforcing the spec must never be the
-thing that strands the money.
+so the mutation LANDED. The note exists at the key or hash the wallet
+disclosed, and whatever stands behind it is the only key to it, so enforcing
+the spec must never be the thing that strands the money.
 
 **A spent-or-unknown refusal from a mutation carries its secrets too.** At a
 SERVICE that has not implemented the replay rule below, a retried rotate,

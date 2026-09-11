@@ -10,10 +10,10 @@ use lnurlcash_core::cash::{
     cash_domain_indices, cash_node_from_hex, cash_node_to_hex, cash_secret_at, derive_cash_child,
     derive_cash_domain_node, derive_cash_root, derive_cash_secret,
 };
-use lnurlcash_core::hash_k1;
 use lnurlcash_core::protocol::{
-    mint_invoice_request, mint_invoice_request_with_hash, parse_invoice, parse_pay_request,
-    parse_verify,
+    melt_request, mint_invoice_request, mint_invoice_request_with_hash, parse_invoice,
+    parse_mutation, parse_pay_request, parse_verify, rotate_request, rotate_request_with_hash,
+    split_request, split_request_with_hash, MutationKind, MutationResponse, Policy, Request,
 };
 use lnurlcash_core::recoverable::{
     cash_node_to_cx1, decode_ck1, decode_cp1, decode_cs1, decode_cx1, derive_cash_address_node,
@@ -32,6 +32,7 @@ use lnurlcash_core::{
     resolve_mint_input, resolve_note_input, same_invoice, to_bech32_lnurl, verify_note_signature,
     verify_note_signature_hash, with_new_k1, without_k1, MintFee,
 };
+use lnurlcash_core::{hash_k1, Error};
 use secp256k1::{ecdsa, Message, Parity, PublicKey, Secp256k1, SecretKey};
 use serde_json::Value;
 
@@ -479,6 +480,142 @@ fn pay_request_vectors() {
             "{name}: must not parse"
         );
     }
+}
+
+// ---- classifying a mutation's response ----
+//
+// responses.json says which call each case goes through (`op`) and, since
+// 0.10.0, which kind of note it mints: `output: "cp1"` or `change: "cp1"`,
+// and a plain hash wherever neither is said. A `cp1` output is owed a `cs1`
+// certificate; a hash output is owed nothing, and a bare OK to one is `ok`.
+//
+// This grades every case that carries a JSON answer, through the same request
+// builders and parser a caller uses, with the default policy. The rest carry
+// no answer this parser ever sees - an unreadable body, a 500, a dropped
+// connection, a timeout - so tests/protocol.rs drives those through the
+// client's own transport.
+
+const RESPONSE_CB: &str = "https://mint.example/w/cb";
+
+fn response_outcome(result: &lnurlcash_core::Result<MutationResponse>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(Error::Unverifiable { .. }) => "unverifiable",
+        Err(Error::NotePending) => "pending",
+        Err(Error::NoteSpent { .. }) => "spent",
+        Err(Error::NoteUnknown { .. }) => "unknown",
+        Err(Error::ServiceRejected(_)) => "error",
+        Err(Error::Ambiguous { .. }) => "ambiguous",
+        Err(other) => panic!("not an outcome responses.json names: {other:?}"),
+    }
+}
+
+/// The request a case is an answer to. A plain note goes through the
+/// generating builders, as a wallet's own rotate does, so its fresh secrets
+/// ride the request; a `cp1` output is one the caller names, so the request
+/// carries none.
+fn response_case_request(case: &Value, cp1s: &[String]) -> (Request, MutationKind) {
+    let k1 = "11".repeat(32);
+    let (secret, change_secret) = ("22".repeat(32), "33".repeat(32));
+    let cp1_output = case["output"].as_str() == Some("cp1");
+    let cp1_change = case["change"].as_str() == Some("cp1");
+    for (field, value) in [("output", &case["output"]), ("change", &case["change"])] {
+        assert!(
+            value.is_null() || value.as_str() == Some("cp1"),
+            "{}: a {field} this suite does not know: {value}",
+            str_of(case, "name")
+        );
+    }
+    match case["op"].as_str().expect("op") {
+        "melt" => (
+            melt_request(RESPONSE_CB, &k1, "lnbc210n1pjq").expect("builds"),
+            MutationKind::Melt,
+        ),
+        "split" => {
+            let request = if cp1_output || cp1_change {
+                let output = if cp1_output {
+                    cp1s[0].clone()
+                } else {
+                    hash_k1(&secret).expect("hash")
+                };
+                let change = if cp1_change {
+                    cp1s[1].clone()
+                } else {
+                    hash_k1(&change_secret).expect("hash")
+                };
+                split_request_with_hash(RESPONSE_CB, &[k1], 5_000, &output, &change)
+            } else {
+                split_request(RESPONSE_CB, &[k1], 5_000, &secret, &change_secret)
+            };
+            (request.expect("builds"), MutationKind::Split)
+        }
+        "mutation" => {
+            assert!(!cp1_change, "a rotate has no change");
+            let request = if cp1_output {
+                rotate_request_with_hash(RESPONSE_CB, &k1, &cp1s[0])
+            } else {
+                rotate_request(RESPONSE_CB, &k1, &secret)
+            };
+            (request.expect("builds"), MutationKind::Rotate)
+        }
+        other => panic!("an op this suite does not know: {other}"),
+    }
+}
+
+#[test]
+fn response_vectors() {
+    let vectors = load("responses.json");
+    // two real Part 2 keys from the same suite, for the cases that mint one
+    let part2 = load("part2.json");
+    let cp1s: Vec<String> = part2["branches"][0]["notes"]
+        .as_array()
+        .expect("notes")
+        .iter()
+        .take(2)
+        .map(|note| str_of(note, "cp1"))
+        .collect();
+
+    let cases = vectors["cases"].as_array().expect("cases");
+    let (mut graded, mut cp1_graded) = (0, 0);
+    for case in cases {
+        let name = str_of(case, "name");
+        let Some(body) = case.get("body") else {
+            // no JSON answer at all: the transport's business, graded in
+            // tests/protocol.rs. Only ever an outcome that may have landed.
+            assert_eq!(str_of(case, "expect"), "ambiguous", "{name}");
+            continue;
+        };
+        let (request, kind) = response_case_request(case, &cp1s);
+        let result = parse_mutation(body, kind, &request.outputs, Policy::default());
+        let expected = str_of(case, "expect");
+        assert_eq!(response_outcome(&result), expected, "{name}: {result:?}");
+        match result {
+            Ok(response) => {
+                assert_eq!(response.signature, opt_str(case, "signature"), "{name}");
+                assert_eq!(
+                    response.change_signature,
+                    opt_str(case, "changeSignature"),
+                    "{name}"
+                );
+            }
+            // The mutation may have landed, or did: whatever secrets the
+            // request carried have to survive the error.
+            Err(err) if matches!(expected.as_str(), "ambiguous" | "unverifiable") => {
+                let carried = err.with_secrets(request.new_secrets.clone());
+                assert_eq!(carried.new_secrets(), request.new_secrets, "{name}");
+            }
+            Err(_) => {}
+        }
+        graded += 1;
+        if !case["output"].is_null() || !case["change"].is_null() {
+            cp1_graded += 1;
+        }
+    }
+    assert!(
+        graded > 10,
+        "too few response cases graded to mean anything"
+    );
+    assert!(cp1_graded >= 3, "0.10.0 carries three cp1 cases");
 }
 
 // ---- derivation ----
