@@ -17,30 +17,45 @@ use crate::urls::is_allowed_service_url;
 
 /// What this crate insists a SERVICE does, rather than merely hopes it does.
 ///
-/// LUD-25 makes offline verification mandatory: a SERVICE MUST publish
-/// `mintPubkey` and MUST sign every note a rotate, split or merge mints. A
-/// wallet that quietly accepted unsigned notes would be handing its holder
-/// something nobody downstream can check, which is the exact gap offline
-/// verification exists to close - so the default insists.
+/// LUD-25 Part 2 certifies `cp1` notes only. A plain hash output has nothing
+/// to attest to without disclosing the secret behind it, so a conforming
+/// SERVICE answers a rotate, split or merge to one with a bare
+/// `{"status":"OK"}`: a plain note is unsigned by design. A `cp1` output is
+/// owed its `cs1` certificate whatever this says, because a `cp1` note that
+/// cannot be checked offline has lost the one thing it is for - see
+/// [`parse_mutation`].
 ///
-/// Turn `require_signatures` off only to talk to a SERVICE that predates the
-/// requirement, and only knowing the cost.
+/// Build one from the default and change only what you mean to:
+/// `Policy { require_mint_pubkey: false, ..Policy::default() }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
+    /// Also demand the old Part 1 signature over a plain hash output, as
+    /// every mint did before the Part 2 rewrite. Off by default: a mint
+    /// following the current draft answers a plain rotate with a bare OK, and
+    /// refusing that would be refusing the spec. With it on, an unsigned hash
+    /// output is [`Error::Unverifiable`], carrying the fresh secrets.
     pub require_signatures: bool,
+    /// Refuse a `withdrawRequest` that publishes no `mintPubkey`, or one that
+    /// is not a 33-byte compressed key: the key a `cp1` note's certificate
+    /// verifies against. On by default. Turn it off only for a Part 1-only
+    /// mint that publishes none, knowing that nothing it issues can then be
+    /// checked offline.
+    pub require_mint_pubkey: bool,
 }
 
 impl Default for Policy {
     fn default() -> Self {
         Policy {
-            require_signatures: true,
+            require_signatures: false,
+            require_mint_pubkey: true,
         }
     }
 }
 
-/// Which mutation a response is being read as, which decides what it must
-/// carry. A melt mints nothing, so it has no signature to return and none is
-/// required; a split mints two notes and owes a signature over each.
+/// Which mutation a response is being read as. Together with the outputs the
+/// request named, it decides what the response must carry: a melt mints
+/// nothing and owes nothing, a rotate or merge owes its one output what that
+/// output's kind is owed, and a split owes each of its two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationKind {
     Melt,
@@ -70,6 +85,12 @@ pub struct Request {
     /// the outcome turns out to be unknown they may be the only copies of notes
     /// the SERVICE has already minted.
     pub new_secrets: Vec<String>,
+    /// The outputs a rotate, split or merge named, exactly as sent: `[output]`
+    /// for a rotate or merge, `[output, change]` for a split, and empty for
+    /// every other request. Each is a hash or a Part 2 `cp1`, and which one
+    /// decides what the response owes it, so hand these to
+    /// [`parse_mutation`] with the response. Not secret: they were on the URL.
+    pub outputs: Vec<String>,
 }
 
 impl Request {
@@ -77,6 +98,14 @@ impl Request {
         Request {
             url,
             new_secrets: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    fn naming(url: String, outputs: &[&str]) -> Self {
+        Request {
+            outputs: outputs.iter().map(|output| output.to_string()).collect(),
+            ..Request::plain(url)
         }
     }
 }
@@ -103,9 +132,9 @@ pub struct WithdrawRequestInfo {
     pub max_withdrawable: u64,
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
-    /// LUD-25 makes offline verification mandatory, so a conforming SERVICE
-    /// always publishes the key its notes verify against here. Only ever
-    /// `None` when the caller set [`Policy::require_signatures`] to false.
+    /// The key a `cp1` note's certificate verifies against, and a Part 1
+    /// signature where a mint still issues one. Only ever `None` when the
+    /// caller set [`Policy::require_mint_pubkey`] to false.
     pub mint_pubkey: Option<String>,
 }
 
@@ -207,7 +236,11 @@ pub struct VerifyResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MutationResponse {
+    /// `sig`. Always present for a `cp1` output: its `cs1` certificate. For a
+    /// plain hash output `None`, unless the mint still issues the old Part 1
+    /// signature over the hash.
     pub signature: Option<String>,
+    /// `sig2`, the same for a split's change.
     pub change_signature: Option<String>,
     /// LUD-25 melt proof (optional), present only on a melt.
     pub pr: Option<String>,
@@ -348,15 +381,7 @@ pub fn parse_note_info(
     // Separate from the shape check above, and separately worded: this response
     // IS a withdrawRequest, it just describes a note nobody can check offline.
     // Saying "not a withdrawRequest" would send a caller after the wrong fault.
-    if policy.require_signatures && !mint_pubkey.as_deref().is_some_and(is_compressed_pubkey) {
-        return Err(Error::Protocol(
-            match mint_pubkey {
-                None => "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)",
-                Some(_) => "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key",
-            }
-            .into(),
-        ));
-    }
+    check_mint_pubkey(mint_pubkey.as_deref(), policy)?;
     Ok(WithdrawRequestInfo {
         callback,
         k1: k1.to_ascii_lowercase(),
@@ -365,6 +390,23 @@ pub fn parse_note_info(
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
     })
+}
+
+/// The `mintPubkey` check both informational GETs make, when
+/// [`Policy::require_mint_pubkey`] asks for it. Its own option since the
+/// Part 2 rewrite: it used to ride on `require_signatures`, which now only
+/// governs what a plain hash output owes, and the two are unrelated.
+fn check_mint_pubkey(mint_pubkey: Option<&str>, policy: Policy) -> Result<()> {
+    if !policy.require_mint_pubkey || mint_pubkey.is_some_and(is_compressed_pubkey) {
+        return Ok(());
+    }
+    Err(Error::Protocol(
+        match mint_pubkey {
+            None => "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)",
+            Some(_) => "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key",
+        }
+        .into(),
+    ))
 }
 
 /// Whether two k1s name one note. A Part 1 secret has one spelling, but a
@@ -385,8 +427,9 @@ fn same_note(a: &str, b: &str) -> bool {
 /// Differs from [`parse_note_info`] in exactly two places, both because there
 /// was no secret in the request: `k1` is not required in the response, and
 /// there is no echo to check against. Everything else - the shape, and the
-/// mandatory `mintPubkey` - is enforced identically, because a note nobody can
-/// verify offline is no more acceptable when it was looked up privately.
+/// `mintPubkey` [`Policy::require_mint_pubkey`] asks for - is enforced
+/// identically, because a note nobody can verify offline is no more
+/// acceptable when it was looked up privately.
 pub fn parse_note_info_by_hash(body: &Value, policy: Policy) -> Result<NoteInfoByHash> {
     if let Err(Error::ServiceRejected(reason)) = reject_error(body) {
         return Err(classify_note_error(&reason));
@@ -405,15 +448,7 @@ pub fn parse_note_info_by_hash(body: &Value, policy: Policy) -> Result<NoteInfoB
         return Err(invalid());
     }
     let mint_pubkey = as_str(body, "mintPubkey");
-    if policy.require_signatures && !mint_pubkey.as_deref().is_some_and(is_compressed_pubkey) {
-        return Err(Error::Protocol(
-            match mint_pubkey {
-                None => "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)",
-                Some(_) => "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key",
-            }
-            .into(),
-        ));
-    }
+    check_mint_pubkey(mint_pubkey.as_deref(), policy)?;
     Ok(NoteInfoByHash {
         callback,
         max_withdrawable,
@@ -511,13 +546,23 @@ pub fn melt_request(callback: &str, k1: &str, pr: &str) -> Result<Request> {
 // goes as `p1`/`p2`, which only a Part 2 mint takes anyway. Decided per
 // value, never by a version flag, which is the rule lnurl-wallet and the
 // TypeScript kit follow too.
+//
+// The same per-value decision says what the response owes each output, so
+// every one of these records the outputs it named on `Request::outputs`, and
+// [`parse_mutation`] reads them back.
+
+/// Whether an output names a Part 2 note. The one test both ends use: the
+/// parameter it is sent under, and what the response owes it.
+fn is_key_output(value: &str) -> bool {
+    is_cp1(&value.trim().to_ascii_lowercase())
+}
 
 fn output_param(
     value: &str,
     hash_name: &'static str,
     key_name: &'static str,
 ) -> (&'static str, String) {
-    let name = if is_cp1(&value.trim().to_ascii_lowercase()) {
+    let name = if is_key_output(value) {
         key_name
     } else {
         hash_name
@@ -526,10 +571,13 @@ fn output_param(
 }
 
 pub fn rotate_request_with_hash(callback: &str, k1: &str, h: &str) -> Result<Request> {
-    Ok(Request::plain(callback_url(
-        callback,
-        &[("k1", k1.to_string()), output_param(h, "h", "p1")],
-    )?))
+    Ok(Request::naming(
+        callback_url(
+            callback,
+            &[("k1", k1.to_string()), output_param(h, "h", "p1")],
+        )?,
+        &[h],
+    ))
 }
 
 pub fn split_request_with_hash(
@@ -543,13 +591,13 @@ pub fn split_request_with_hash(
     params.push(("amount", amount_msat.to_string()));
     params.push(output_param(h, "h", "p1"));
     params.push(output_param(h2, "h2", "p2"));
-    Ok(Request::plain(callback_url(callback, &params)?))
+    Ok(Request::naming(callback_url(callback, &params)?, &[h, h2]))
 }
 
 pub fn merge_request_with_hash(callback: &str, k1s: &[String], h: &str) -> Result<Request> {
     let mut params: Vec<(&str, String)> = k1s.iter().map(|k1| ("k1", k1.clone())).collect();
     params.push(output_param(h, "h", "p1"));
-    Ok(Request::plain(callback_url(callback, &params)?))
+    Ok(Request::naming(callback_url(callback, &params)?, &[h]))
 }
 
 // ---- the generating variants ----
@@ -596,9 +644,26 @@ pub fn merge_request(callback: &str, k1s: &[String], new_secret: &str) -> Result
 ///
 /// A 200 that does not confirm is [`Error::Ambiguous`], not a failure: the
 /// SERVICE may have applied the mutation and merely failed to say so.
+///
+/// `outputs` is [`Request::outputs`] from the request this answers, and says
+/// what each output is owed:
+///
+/// - A `cp1` output is owed its `cs1` certificate, in `sig` (`sig2` for a
+///   split's change), whatever the [`Policy`] says. One that comes back
+///   without it is [`Error::Unverifiable`]: the note exists at the key the
+///   WALLET disclosed, but nobody can check it offline, which is the whole
+///   reason to hold a `cp1` note.
+/// - A plain hash output is owed nothing, and comes back with its signature
+///   `None`: LUD-25 Part 2 certifies `cp1` notes only. Only
+///   [`Policy::require_signatures`] refuses one for being unsigned.
+///
+/// A signature that is present is returned as sent, for either kind: a mint
+/// still issuing the old Part 1 signature over a hash is fine wherever it
+/// verifies. An output missing from `outputs` is read as a hash.
 pub fn parse_mutation(
     body: &Value,
     kind: MutationKind,
+    outputs: &[String],
     policy: Policy,
 ) -> Result<MutationResponse> {
     if let Err(Error::ServiceRejected(reason)) = reject_error(body) {
@@ -611,25 +676,37 @@ pub fn parse_mutation(
     }
     let signature = as_str(body, "sig").filter(|s| !s.is_empty());
     let change_signature = as_str(body, "sig2").filter(|s| !s.is_empty());
-    // Every mutation the replay rule covers owes a signature over each note it
-    // mints. The mutation has already landed by the time this is checked -
-    // `status` was OK - so the caller of this function must attach the fresh
-    // secrets to the error, or enforcing the spec becomes the thing that loses
-    // the money. See `Error::with_secrets`.
-    if policy.require_signatures {
-        let missing = match kind {
-            MutationKind::Melt => None,
-            MutationKind::Split if signature.is_none() => Some("split"),
-            MutationKind::Split if change_signature.is_none() => Some("split's change"),
-            MutationKind::Split => None,
-            MutationKind::Rotate if signature.is_none() => Some("rotate"),
-            MutationKind::Merge if signature.is_none() => Some("merge"),
-            _ => None,
-        };
-        if let Some(what) = missing {
+    // The mutation has already landed by the time this is checked - `status`
+    // was OK - so the caller of this function must attach the fresh secrets
+    // to the error, or enforcing the spec becomes the thing that loses the
+    // money. See `Error::with_secrets`.
+    let owed = |returned: &Option<String>, index: usize, what: &str| -> Result<()> {
+        if returned.is_some() {
+            return Ok(());
+        }
+        if outputs
+            .get(index)
+            .is_some_and(|output| is_key_output(output))
+        {
+            return Err(Error::unverifiable(format!(
+                "the service confirmed the {what} to a cp1 output but returned no cs1 certificate, which LUD-25 Part 2 requires, so the note it just minted cannot be verified offline. The note exists - keep the key"
+            )));
+        }
+        if policy.require_signatures {
             return Err(Error::unverifiable(format!(
                 "the service confirmed the {what} but returned no signature, so the note it just minted cannot be verified offline. The note exists - keep the secret"
             )));
+        }
+        Ok(())
+    };
+    // in output order, so the message names the output actually missing one
+    match kind {
+        MutationKind::Melt => {}
+        MutationKind::Rotate => owed(&signature, 0, "rotate")?,
+        MutationKind::Merge => owed(&signature, 0, "merge")?,
+        MutationKind::Split => {
+            owed(&signature, 0, "split")?;
+            owed(&change_signature, 1, "split's change")?;
         }
     }
     Ok(MutationResponse {
@@ -843,6 +920,155 @@ mod tests {
             body[key] = value.clone();
         }
         body
+    }
+
+    // ---- what a mutation owes, and what a withdrawRequest must carry ----
+
+    fn plain(seed: u8) -> String {
+        crate::secrets::hash_k1(&hex::encode([seed; 32])).expect("a hash")
+    }
+
+    fn strict() -> Policy {
+        Policy {
+            require_signatures: true,
+            ..Policy::default()
+        }
+    }
+
+    #[test]
+    fn the_default_policy_is_the_spec() {
+        assert_eq!(
+            Policy::default(),
+            Policy {
+                require_signatures: false,
+                require_mint_pubkey: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_plain_output_is_unsigned_by_design() {
+        let ok = json!({"status": "OK"});
+        let one = vec![plain(2)];
+        let two = vec![plain(2), plain(3)];
+        for (kind, outputs) in [
+            (MutationKind::Rotate, &one),
+            (MutationKind::Merge, &one),
+            (MutationKind::Split, &two),
+        ] {
+            let response = parse_mutation(&ok, kind, outputs, Policy::default())
+                .unwrap_or_else(|err| panic!("{kind:?}: {err}"));
+            assert_eq!(response.signature, None, "{kind:?}");
+            assert_eq!(response.change_signature, None, "{kind:?}");
+        }
+        // an output this was never told about is read as a hash
+        assert!(parse_mutation(&ok, MutationKind::Rotate, &[], Policy::default()).is_ok());
+        // a Part 1 signature a mint still issues comes back as sent
+        let signed = parse_mutation(
+            &json!({"status": "OK", "sig": "ab".repeat(65)}),
+            MutationKind::Rotate,
+            &one,
+            Policy::default(),
+        )
+        .unwrap();
+        assert_eq!(signed.signature, Some("ab".repeat(65)));
+    }
+
+    #[test]
+    fn require_signatures_still_refuses_an_unsigned_plain_output() {
+        let ok = json!({"status": "OK"});
+        let one = vec![plain(2)];
+        let two = vec![plain(2), plain(3)];
+        for (kind, outputs) in [(MutationKind::Rotate, &one), (MutationKind::Merge, &one)] {
+            let err = parse_mutation(&ok, kind, outputs, strict()).unwrap_err();
+            assert!(
+                matches!(err, Error::Unverifiable { .. }),
+                "{kind:?}: {err:?}"
+            );
+        }
+        let err = parse_mutation(
+            &json!({"status": "OK", "sig": "ab".repeat(65)}),
+            MutationKind::Split,
+            &two,
+            strict(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Unverifiable { .. }), "{err:?}");
+        assert!(err.to_string().contains("split's change"), "{err}");
+        // signed throughout, it is fine
+        let both = json!({"status": "OK", "sig": "ab".repeat(65), "sig2": "cd".repeat(65)});
+        assert!(parse_mutation(&both, MutationKind::Split, &two, strict()).is_ok());
+        // and a melt mints nothing, so it owes nothing under any policy
+        assert!(parse_mutation(&ok, MutationKind::Melt, &[], strict()).is_ok());
+    }
+
+    fn withdraw_request(k1: &str, mint_pubkey: Option<&str>) -> Value {
+        let mut body = json!({
+            "tag": "withdrawRequest",
+            "callback": "https://mint.example/w/cb",
+            "k1": k1,
+            "minWithdrawable": 1000u64,
+            "maxWithdrawable": 21_000u64,
+        });
+        if let Some(key) = mint_pubkey {
+            body["mintPubkey"] = json!(key);
+        }
+        body
+    }
+
+    #[test]
+    fn a_mint_pubkey_is_required_by_default_and_only_by_its_own_option() {
+        let k1 = "11".repeat(32);
+        let url = format!("https://mint.example/w?k1={k1}");
+        let key = format!("02{}", "aa".repeat(32));
+        let lenient = Policy {
+            require_mint_pubkey: false,
+            ..Policy::default()
+        };
+        // signatures demanded, the key not: the two no longer ride together
+        let signatures_only = Policy {
+            require_signatures: true,
+            require_mint_pubkey: false,
+        };
+
+        for missing in [None, Some("not a key")] {
+            let body = withdraw_request(&k1, missing);
+            // refused by default, even though signatures are off by default
+            for policy in [Policy::default(), strict()] {
+                assert!(
+                    matches!(
+                        parse_note_info(&body, &url, policy),
+                        Err(Error::Protocol(_))
+                    ),
+                    "{missing:?} {policy:?}"
+                );
+                assert!(
+                    matches!(
+                        parse_note_info_by_hash(&body, policy),
+                        Err(Error::Protocol(_))
+                    ),
+                    "{missing:?} {policy:?}"
+                );
+            }
+            // and admitted, as it is, once the caller opts out
+            for policy in [lenient, signatures_only] {
+                let info = parse_note_info(&body, &url, policy)
+                    .unwrap_or_else(|err| panic!("{missing:?} {policy:?}: {err}"));
+                assert_eq!(
+                    info.mint_pubkey,
+                    missing.map(|value| value.to_ascii_lowercase())
+                );
+                assert!(parse_note_info_by_hash(&body, policy).is_ok());
+            }
+        }
+
+        let published = parse_note_info(
+            &withdraw_request(&k1, Some(&key.to_ascii_uppercase())),
+            &url,
+            Policy::default(),
+        )
+        .unwrap();
+        assert_eq!(published.mint_pubkey, Some(key));
     }
 
     #[test]

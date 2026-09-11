@@ -120,8 +120,8 @@ pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<Strin
 /// The same note with its secret swapped out, after a rotate, split or merge.
 ///
 /// A signature only carries over when the response actually returned a fresh
-/// one: a mutation at a SERVICE without offline verification drops any stale
-/// sig, since it no longer matches the new secret.
+/// one: a mutation to a plain hash output, which is unsigned by design, drops
+/// any stale sig, since it no longer matches the new secret.
 pub fn with_new_k1(
     url: &str,
     k1: &str,

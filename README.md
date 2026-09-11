@@ -99,13 +99,21 @@ operation and the caller never sees an error at all
 `pr`, is paid asynchronously and has no replay guarantee; and never a
 definitive refusal, which is the service's considered answer.
 
-**2b. Offline verification is mandatory.** A service MUST publish `mintPubkey`
-and MUST sign every note a rotate, split or merge mints. `parse_note_info`
-refuses a `withdrawRequest` without a valid one, and a confirmed-but-unsigned
-mutation raises `Error::Unverifiable` — which **carries the fresh secrets**,
-because the mutation landed and the note is real. Set
-`Policy { require_signatures: false }` for a service that predates the
-requirement.
+**2b. A plain note is unsigned; a `cp1` note is not.** LUD-25 Part 2
+certifies `cp1` notes only, because a hash has nothing to attest to without
+disclosing the secret. So a rotate, split or merge to a hash output comes back
+with `signature` set to `None`, and that is the spec, not a fault. A `cp1`
+output is owed its `cs1` certificate whatever the policy says: one that comes
+back without it raises `Error::Unverifiable`, which **carries the fresh
+secrets**, because the mutation landed and the note is real. Hand
+`parse_mutation` the request's `outputs` so it knows which kind it asked for.
+
+`Policy { require_signatures: true, ..Policy::default() }` also demands the
+old Part 1 signature over a hash, as mints did before the Part 2 rewrite.
+`parse_note_info` refuses a `withdrawRequest` without a valid `mintPubkey`;
+`Policy { require_mint_pubkey: false, ..Policy::default() }` admits a Part
+1-only mint that publishes none. If you want a note a recipient can check
+offline, hold a `cp1` note.
 
 **3. A melt's `OK` means "in flight", not "spent".** The service pays
 asynchronously and only burns the note once the payment settles, restoring it

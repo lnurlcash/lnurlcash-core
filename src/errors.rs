@@ -15,7 +15,8 @@
 //! a mutation it ALREADY applied looks like. Read them with
 //! [`Error::new_secrets`] and persist them before believing anything.
 //! - [`Error::Unverifiable`] — a MUTATION landed and the SERVICE returned no
-//!   signature over it. The note exists; it just cannot be verified offline.
+//!   certificate for a `cp1` output it was owed one for. The note exists; it
+//!   just cannot be verified offline.
 //!
 //! Treating an ambiguous failure as a definitive one is how wallets lose
 //! money: a rotate that times out after the SERVICE burned the input has
@@ -72,19 +73,22 @@ pub enum Error {
     },
 
     /// The SERVICE confirmed a rotate, split or merge with `{"status":"OK"}`
-    /// but returned no signature over the hash it was given. LUD-25 makes
-    /// offline verification mandatory, so this is a non-conforming SERVICE -
-    /// but the mutation LANDED. The note exists, at the hash the caller
-    /// disclosed, and the WALLET-generated secret behind it is the only key to
+    /// but returned no `cs1` certificate for a `cp1` output. LUD-25 Part 2
+    /// requires one on every `cp1` output, so this is a non-conforming
+    /// SERVICE - but the mutation LANDED. The note exists, at the key or hash
+    /// the caller disclosed, and whatever stands behind it is the only key to
     /// that value anywhere.
     ///
     /// So this is an error about the note's VERIFIABILITY, never about its
     /// existence, and it carries the secrets for the same reason
     /// [`Error::Ambiguous`] does: refusing without them would strand real money
-    /// to make a point about conformance.
+    /// to make a point about conformance. Empty for a mutation whose output
+    /// the caller named, since this crate never saw the secret behind it.
     ///
-    /// Only ever raised when the policy requires signatures, which is the
-    /// default.
+    /// Raised for a `cp1` output whatever the policy says, and for a plain
+    /// hash output only when [`crate::protocol::Policy::require_signatures`]
+    /// asks for the old Part 1 signature over it. A plain note is unsigned by
+    /// design, so by default a hash output never raises this.
     #[error("{message}")]
     Unverifiable {
         message: String,
