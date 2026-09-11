@@ -42,8 +42,8 @@ that holds the id but not the k1.
 One note has more than one valid `ck1` (anyone can flip one to its high-S
 twin), so a SERVICE echoing a different `ck1` that recovers to the same key has
 named the same note; one recovering to any other key is still refused, and a k1
-with no id still has to match exactly. The TypeScript kit compares strings
-here; the Go kit compares ids, as this now does.
+with no id still has to match exactly. All the kits compare the echo this way,
+as the note it names.
 
 All of it crosses the FFI, along with `derive_cash_child` and the three
 `*_request_with_hash` builders, which were not exported before and which a

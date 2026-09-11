@@ -84,8 +84,9 @@ verify_note_signature also takes a ck1 as k1 and a cs1 as the signature;
 Wire: a ck1 goes wherever a k1 does; a cp1 wherever an output does.
   mint_invoice_request_with_hash: the comment alone (a hash also sends h).
   rotate/split/merge_request_with_hash: p1/p2 for a cp1, h/h2 for a hash
-  parse_note_info checks the echoed k1 by note id, so a mint echoing the
-  high-S twin of our ck1 is the same note; another key is still refused
+  parse_note_info compares the echoed k1 as the note it names (by note id),
+  as all the kits do: a mint echoing the high-S twin of our ck1 is the same
+  note; another key is still refused
 derive_nostr_cash_seed(sk) / derive_nostr_address_node(sk, host)   NOT
   LUD-25: a branch from a Nostr identity key, via
   HMAC-SHA256(key = sk, msg = "LNURLcash/nostr-seed"), then the address path
