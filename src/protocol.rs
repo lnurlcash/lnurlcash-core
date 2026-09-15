@@ -17,23 +17,19 @@ use crate::urls::is_allowed_service_url;
 
 /// What this crate insists a SERVICE does, rather than merely hopes it does.
 ///
-/// LUD-25 Part 2 certifies `cp1` notes only. A plain hash output has nothing
-/// to attest to without disclosing the secret behind it, so a conforming
-/// SERVICE answers a rotate, split or merge to one with a bare
-/// `{"status":"OK"}`: a plain note is unsigned by design. A `cp1` output is
-/// owed its `cs1` certificate whatever this says, because a `cp1` note that
-/// cannot be checked offline has lost the one thing it is for - see
-/// [`parse_mutation`].
+/// The reference mint signs legacy hash outputs in raw Part 1 form when a
+/// signer is available, and may omit that proof in no-signer mode. A `cp1`
+/// output is owed its amount-bearing `cs1` certificate whatever this says -
+/// see [`parse_mutation`].
 ///
 /// Build one from the default and change only what you mean to:
 /// `Policy { require_mint_pubkey: false, ..Policy::default() }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
-    /// Also demand the old Part 1 signature over a plain hash output, as
-    /// every mint did before the Part 2 rewrite. Off by default: a mint
-    /// following the current draft answers a plain rotate with a bare OK, and
-    /// refusing that would be refusing the spec. With it on, an unsigned hash
-    /// output is [`Error::Unverifiable`], carrying the fresh secrets.
+    /// Demand the raw Part 1 signature over a legacy hash output, matching the
+    /// committed reference wallet. Off by default to admit the reference
+    /// mint's no-signer mode. With it on, an unsigned hash output is
+    /// [`Error::Unverifiable`], carrying the fresh secrets.
     pub require_signatures: bool,
     /// Refuse a `withdrawRequest` that publishes no `mintPubkey`, or one that
     /// is not a 33-byte compressed key: the key a `cp1` note's certificate
@@ -653,9 +649,9 @@ pub fn merge_request(callback: &str, k1s: &[String], new_secret: &str) -> Result
 ///   without it is [`Error::Unverifiable`]: the note exists at the key the
 ///   WALLET disclosed, but nobody can check it offline, which is the whole
 ///   reason to hold a `cp1` note.
-/// - A plain hash output is owed nothing, and comes back with its signature
-///   `None`: LUD-25 Part 2 certifies `cp1` notes only. Only
-///   [`Policy::require_signatures`] refuses one for being unsigned.
+/// - A legacy hash output carries the reference mint's raw Part 1 signature
+///   when signing is available. [`Policy::require_signatures`] decides whether
+///   no-signer omission is accepted.
 ///
 /// A signature that is present is returned as sent, for either kind: a mint
 /// still issuing the old Part 1 signature over a hash is fine wherever it
@@ -947,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_output_is_unsigned_by_design() {
+    fn the_default_tolerates_a_no_signer_legacy_output() {
         let ok = json!({"status": "OK"});
         let one = vec![plain(2)];
         let two = vec![plain(2), plain(3)];

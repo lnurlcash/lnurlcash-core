@@ -2,7 +2,7 @@
 
 use url::Url;
 
-use crate::recoverable::{is_cp1, note_id_of};
+use crate::recoverable::{decode_cs1_with_amount, is_cp1, is_cs1_with_amount, note_id_of};
 use crate::urls::{from_lud17, resolve_lnurl_input};
 
 fn first_param(url: &str, key: &str) -> Option<String> {
@@ -24,9 +24,13 @@ pub fn note_k1(url: &str) -> Option<String> {
 /// What a note CLAIMS to carry. Only a claim by whoever encoded it - a SERVICE
 /// ignores it at the informational endpoint - so it is safe to display before
 /// contacting the SERVICE but must not be trusted without either a matching
-/// signature or a fresh online GET.
+/// signature or a fresh online GET. When there is no separate `amount`, a
+/// current amount-bearing `cs1` carries the same declaration in its HRP.
 pub fn note_declared_amount(url: &str) -> Option<u64> {
-    first_param(url, "amount")?.parse().ok()
+    if let Some(amount) = first_param(url, "amount") {
+        return amount.parse().ok();
+    }
+    decode_cs1_with_amount(&first_param(url, "sig")?).map(|cs1| cs1.amount_msat)
 }
 
 pub fn note_signature(url: &str) -> Option<String> {
@@ -120,8 +124,8 @@ pub fn build_note_info_url_by_hash(withdraw_link: &str, h: &str) -> Option<Strin
 /// The same note with its secret swapped out, after a rotate, split or merge.
 ///
 /// A signature only carries over when the response actually returned a fresh
-/// one: a mutation to a plain hash output, which is unsigned by design, drops
-/// any stale sig, since it no longer matches the new secret.
+/// one: a mutation with no returned signature drops any stale sig, since it no
+/// longer matches the new secret.
 pub fn with_new_k1(
     url: &str,
     k1: &str,
@@ -129,6 +133,7 @@ pub fn with_new_k1(
     signature: Option<&str>,
 ) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
+    let amount_is_implied = signature.is_some_and(is_cs1_with_amount);
     let mut pairs = Vec::new();
     let (mut saw_k1, mut saw_amount, mut saw_sig) = (false, false, false);
     for (key, value) in parsed.query_pairs() {
@@ -138,8 +143,10 @@ pub fn with_new_k1(
                 saw_k1 = true;
             }
             "amount" => {
-                pairs.push(("amount".to_string(), amount_msat.to_string()));
-                saw_amount = true;
+                if !amount_is_implied {
+                    pairs.push(("amount".to_string(), amount_msat.to_string()));
+                    saw_amount = true;
+                }
             }
             "sig" => {
                 if let Some(sig) = signature {
@@ -153,7 +160,7 @@ pub fn with_new_k1(
     if !saw_k1 {
         pairs.push(("k1".to_string(), k1.to_ascii_lowercase()));
     }
-    if !saw_amount {
+    if !saw_amount && !amount_is_implied {
         pairs.push(("amount".to_string(), amount_msat.to_string()));
     }
     if let Some(sig) = signature {
@@ -169,14 +176,17 @@ pub fn with_new_k1(
 /// the device rather than in this process.
 pub fn without_k1(url: &str, amount_msat: u64, signature: Option<&str>) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
+    let amount_is_implied = signature.is_some_and(is_cs1_with_amount);
     let mut pairs = Vec::new();
     let (mut saw_amount, mut saw_sig) = (false, false);
     for (key, value) in parsed.query_pairs() {
         match key.as_ref() {
             "k1" => continue,
             "amount" => {
-                pairs.push(("amount".to_string(), amount_msat.to_string()));
-                saw_amount = true;
+                if !amount_is_implied {
+                    pairs.push(("amount".to_string(), amount_msat.to_string()));
+                    saw_amount = true;
+                }
             }
             "sig" => {
                 if let Some(sig) = signature {
@@ -187,7 +197,7 @@ pub fn without_k1(url: &str, amount_msat: u64, signature: Option<&str>) -> Optio
             _ => pairs.push((key.into_owned(), value.into_owned())),
         }
     }
-    if !saw_amount {
+    if !saw_amount && !amount_is_implied {
         pairs.push(("amount".to_string(), amount_msat.to_string()));
     }
     if let Some(sig) = signature {

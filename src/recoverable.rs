@@ -6,8 +6,9 @@
 //! recoverable signature by `sk` over a fixed message: the SERVICE recovers
 //! `pk` from it and looks the note up. The SERVICE certifies each note with
 //! `cs1`, the same signature it has always made, over `hex(pk)` instead of a
-//! hash, so a recipient can check issuance offline with nothing but the `ck1`
-//! and the `cs1` (see [`crate::signature`]).
+//! hash. Its human-readable part also carries the signed amount using BOLT-11
+//! amount rules, so a recipient can check issuance offline with nothing but
+//! the `ck1` and the `cs1` (see [`crate::signature`]).
 //!
 //! The names and semantics follow the TypeScript kit, which follows
 //! lnurl-wallet's `src/lib`. Where the draft's text and that code disagree,
@@ -79,8 +80,57 @@ pub fn is_ck1(value: &str) -> bool {
     decode_ck1(value).is_some()
 }
 
-/// A SERVICE's issuance certificate: the same 65-byte layout, signed by the
-/// mint over the note's key, as a `cs1`.
+/// A decoded current `cs1`: the amount committed in its human-readable part
+/// and the mint's raw 65-byte recoverable signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cs1 {
+    pub amount_msat: u64,
+    pub signature: [u8; 65],
+}
+
+fn encode_amount_suffix(amount_msat: u64) -> String {
+    for (suffix, unit) in [
+        ("", 100_000_000_000u64),
+        ("m", 100_000_000u64),
+        ("u", 100_000u64),
+        ("n", 100u64),
+    ] {
+        if amount_msat % unit == 0 {
+            return format!("{}{suffix}", amount_msat / unit);
+        }
+    }
+    // One pico-BTC unit is 0.1 msat. u128 keeps amount * 10 safe for every
+    // u64 amount before it is rendered as decimal digits.
+    format!("{}p", u128::from(amount_msat) * 10)
+}
+
+fn decode_amount_suffix(value: &str) -> Option<u64> {
+    let (digits, unit) = match value.as_bytes().last().copied() {
+        Some(b'm') => (&value[..value.len() - 1], 'm'),
+        Some(b'u') => (&value[..value.len() - 1], 'u'),
+        Some(b'n') => (&value[..value.len() - 1], 'n'),
+        Some(b'p') => (&value[..value.len() - 1], 'p'),
+        _ => (value, '\0'),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.parse::<u128>().ok()?;
+    let amount = match unit {
+        '\0' => digits.checked_mul(100_000_000_000)?,
+        'm' => digits.checked_mul(100_000_000)?,
+        'u' => digits.checked_mul(100_000)?,
+        'n' => digits.checked_mul(100)?,
+        'p' if digits % 10 == 0 => digits / 10,
+        'p' => return None,
+        _ => unreachable!(),
+    };
+    amount.try_into().ok()
+}
+
+/// Legacy fixed-HRP certificate, retained for compatibility with notes made
+/// before the amount moved into `cs1`. New code should use
+/// [`encode_cs1_with_amount`].
 pub fn encode_cs1(signature: &[u8; 65]) -> String {
     encode_fixed("cs", signature)
 }
@@ -91,6 +141,43 @@ pub fn decode_cs1(value: &str) -> Option<[u8; 65]> {
 
 pub fn is_cs1(value: &str) -> bool {
     decode_cs1(value).is_some()
+}
+
+/// A SERVICE's current issuance certificate. The HRP is `cs` followed by
+/// the signed amount using BOLT-11's amount suffix rules; the payload is the
+/// mint's 65-byte recoverable signature over that amount and the note key.
+pub fn encode_cs1_with_amount(amount_msat: u64, signature: &[u8; 65]) -> String {
+    encode_fixed(
+        &format!("cs{}", encode_amount_suffix(amount_msat)),
+        signature,
+    )
+}
+
+pub fn decode_cs1_with_amount(value: &str) -> Option<Cs1> {
+    let trimmed = value.trim();
+    let separator = trimmed.rfind('1')?;
+    let hrp = trimmed[..separator].to_ascii_lowercase();
+    let amount_msat = decode_amount_suffix(hrp.strip_prefix("cs")?)?;
+    let signature = decode_fixed(&hrp, trimmed)?;
+    Some(Cs1 {
+        amount_msat,
+        signature,
+    })
+}
+
+pub fn is_cs1_with_amount(value: &str) -> bool {
+    decode_cs1_with_amount(value).is_some()
+}
+
+/// The raw signature from either current or legacy `cs1` form.
+pub fn decode_any_cs1(value: &str) -> Option<[u8; 65]> {
+    decode_cs1_with_amount(value)
+        .map(|cs1| cs1.signature)
+        .or_else(|| decode_cs1(value))
+}
+
+pub fn is_any_cs1(value: &str) -> bool {
+    decode_any_cs1(value).is_some()
 }
 
 /// A watch-only branch export: the branch's x-only public key and its chain
@@ -383,7 +470,7 @@ mod tests {
         [
             ("cp", encode_cp1(&pubkey)),
             ("ck", encode_ck1(&signature)),
-            ("cs", encode_cs1(&signature)),
+            ("cs", encode_cs1_with_amount(21_000, &signature)),
             ("cx", encode_cx1(&pubkey, &[0x22; 32])),
         ]
     }
@@ -392,7 +479,7 @@ mod tests {
         match hrp {
             "cp" => is_cp1(value),
             "ck" => is_ck1(value),
-            "cs" => is_cs1(value),
+            "cs" => is_cs1_with_amount(value),
             "cx" => is_cx1(value),
             _ => unreachable!(),
         }

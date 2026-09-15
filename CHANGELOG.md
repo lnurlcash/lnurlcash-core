@@ -5,6 +5,16 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Reference address proofs and compact note URLs
+
+- Add `address_proof_digest` and `sign_address_proof` for the reference
+  mint's signed register/update/unregister flow. Proofs use the address
+  branch's index-0 key and are bound to both action and normalised username.
+- Read a note's declared amount from an amount-bearing `cs1` when the URL has
+  no separate `amount`, and omit that duplicate parameter when rebuilding a
+  URL carrying a current certificate.
+- Grade both behaviours against `lnurlcash-conformance` 0.11.0 vectors.
+
 ### The informational GET, graded
 
 - Graded against `lnurlcash-conformance` 0.10.0's `withdraw-info.json`, every
@@ -14,17 +24,17 @@ carry breaking changes; pin an exact version.
   fractional `maxWithdrawable` and one past `u64::MAX` rather than rounding
   either. No change to the FFI surface.
 
-### A plain note is unsigned
+### No-signer legacy compatibility
 
-LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing to attest
-to without disclosing the secret behind it. The reference mint and moneyer now
-answer a rotate, split or merge to a hash output with a bare
-`{"status":"OK"}`, and this crate follows, as the TypeScript kit now does.
+The reference mint signs a legacy hash output with a raw Part 1 signature when
+a signer is available and may omit it in no-signer mode. The committed
+TypeScript reference wallet requires it; this crate keeps a tolerant default
+and exposes the strict behaviour as policy.
 
-- `Policy::require_signatures` now defaults to **false**. A hash output that
-  comes back unsigned is the spec, not a fault: `signature` (and
-  `change_signature`) is `None`, and no `Error::Unverifiable` is raised. Set it
-  true to keep demanding the old Part 1 signature over the hash.
+- `Policy::require_signatures` now defaults to **false**. In no-signer mode,
+  `signature` (and `change_signature`) is `None` and no
+  `Error::Unverifiable` is raised. Set it true to match the strict reference
+  wallet and demand the raw Part 1 signature over the hash.
 - A `cp1` output is owed its `cs1` certificate whatever the policy says. A
   rotate, split or merge naming a `cp1` output (sent as `p1`, or `p2` for a
   split's change) that comes back without `sig` (or `sig2` for the change) is
@@ -66,9 +76,9 @@ with a JSON answer goes through the parser; each plain-note case also goes
 through the client's own transport, a 500, a dropped connection and a timeout
 included.
 
-If you relied on the default to refuse unsigned plain notes, set
-`require_signatures: true`. If you only ever wanted verifiable notes, hold
-`cp1` notes, which are the only kind the spec now makes verifiable.
+If you relied on the default to refuse unsigned legacy outputs, set
+`require_signatures: true`. For an amount-bearing certificate, hold `cp1`
+notes.
 
 ### LUD-25 Part 2: notes keyed by a public key
 
@@ -77,9 +87,13 @@ semantics.
 
 - The four bech32m strings: `cp1` (a note's x-only key), `ck1` (the 65-byte
   ownership signature that spends it), `cs1` (the mint's certificate) and
-  `cx1` (a watch-only branch). Fixed lengths, no 90-character limit, strict per
-  BIP-350: mixed case, a bech32 checksum, the wrong prefix or length and
-  non-zero padding are all refused. Decoders return `None` and never panic.
+  `cx1` (a watch-only branch). Current `cs1` values carry their amount in the
+  HRP using BOLT-11 rules; the explicit `encode/decode_cs1_with_amount`
+  functions handle them, while the fixed-HRP codec remains for legacy notes
+  and `decode_any_cs1` accepts both. Payload lengths are fixed, with no
+  90-character limit, strict per BIP-350: mixed case, a bech32 checksum, the
+  wrong prefix or length and non-zero padding are all refused. Decoders return
+  `None` and never panic.
 - `derive_note_pubkey` (watch-only, from a `cx1`) and `derive_note_secret_key`:
   the BIP-341-style tweak, through libsecp256k1's own x-only tweak functions.
   `i` is any u32. A tweak at or above the curve order is an error, never
@@ -172,8 +186,9 @@ and the adversarial mock mint.
 **A note owed a certificate is refused without one, and only that note.** A
 `cp1` note is owed its `cs1`, so `parse_mutation` raises `Error::Unverifiable`
 when a SERVICE confirms a mutation to one without it, whatever the policy. A
-plain hash note is unsigned by design and passes, unless
-`Policy::require_signatures` asks for the old Part 1 signature. And
+a legacy hash note may be unsigned in no-signer mode and passes under the
+tolerant default, unless `Policy::require_signatures` asks for the raw Part 1
+signature. And
 `parse_note_info` refuses a `withdrawRequest` publishing no `mintPubkey`, or
 one that is not a 33-byte compressed secp256k1 key, unless
 `Policy::require_mint_pubkey` is off.

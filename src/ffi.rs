@@ -53,9 +53,9 @@ impl From<protocol::Request> for FfiRequest {
 /// change something.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct FfiPolicy {
-    /// Also demand the old Part 1 signature over a plain hash output. Off by
-    /// default: LUD-25 Part 2 certifies `cp1` notes only, so a plain note is
-    /// unsigned by design. A `cp1` output is owed its `cs1` certificate
+    /// Demand the raw Part 1 signature over a legacy hash output, matching the
+    /// committed reference wallet. Off by default to admit a reference mint
+    /// running without a signer. A `cp1` output is owed its `cs1` certificate
     /// whatever this says.
     #[uniffi(default = false)]
     pub require_signatures: bool,
@@ -479,6 +479,22 @@ impl From<recoverable::Cx1> for FfiCx1 {
     }
 }
 
+/// An amount-bearing mint certificate, with its signature bytes as hex.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiCs1 {
+    pub amount_msat: u64,
+    pub signature: String,
+}
+
+impl From<recoverable::Cs1> for FfiCs1 {
+    fn from(cs1: recoverable::Cs1) -> Self {
+        FfiCs1 {
+            amount_msat: cs1.amount_msat,
+            signature: hex::encode(cs1.signature),
+        }
+    }
+}
+
 /// A note's 32-byte x-only public key as a `cp1`.
 #[uniffi::export]
 pub fn encode_cp1(pubkey_x_only_hex: &str) -> FfiResult<String> {
@@ -517,7 +533,8 @@ pub fn is_ck1(value: &str) -> bool {
     recoverable::is_ck1(value)
 }
 
-/// A mint's 65-byte certificate as a `cs1`.
+/// A legacy fixed-HRP mint certificate. New code should use
+/// [`encode_cs1_with_amount`].
 #[uniffi::export]
 pub fn encode_cs1(signature_hex: &str) -> FfiResult<String> {
     Ok(recoverable::encode_cs1(&hex_array(
@@ -534,6 +551,35 @@ pub fn decode_cs1(value: &str) -> Option<String> {
 #[uniffi::export]
 pub fn is_cs1(value: &str) -> bool {
     recoverable::is_cs1(value)
+}
+
+/// A current amount-bearing mint certificate.
+#[uniffi::export]
+pub fn encode_cs1_with_amount(amount_msat: u64, signature_hex: &str) -> FfiResult<String> {
+    Ok(recoverable::encode_cs1_with_amount(
+        amount_msat,
+        &hex_array(signature_hex, "a certificate")?,
+    ))
+}
+
+#[uniffi::export]
+pub fn decode_cs1_with_amount(value: &str) -> Option<FfiCs1> {
+    recoverable::decode_cs1_with_amount(value).map(Into::into)
+}
+
+#[uniffi::export]
+pub fn is_cs1_with_amount(value: &str) -> bool {
+    recoverable::is_cs1_with_amount(value)
+}
+
+#[uniffi::export]
+pub fn decode_any_cs1(value: &str) -> Option<String> {
+    recoverable::decode_any_cs1(value).map(hex::encode)
+}
+
+#[uniffi::export]
+pub fn is_any_cs1(value: &str) -> bool {
+    recoverable::is_any_cs1(value)
 }
 
 #[uniffi::export]
@@ -592,6 +638,21 @@ pub fn sign_note_ownership(secret_key_hex: &str) -> FfiResult<String> {
         secret_key_hex,
         "a note secret key",
     )?)?))
+}
+
+/// A register/update or unregister proof by the branch's index-0 key, as raw
+/// `r || s || recovery-id` hex.
+#[uniffi::export]
+pub fn sign_address_proof(
+    index_zero_secret_key_hex: &str,
+    action: &str,
+    username: &str,
+) -> FfiResult<String> {
+    Ok(hex::encode(signature::sign_address_proof(
+        &hex_array(index_zero_secret_key_hex, "an index-zero secret key")?,
+        action,
+        username,
+    )?))
 }
 
 #[uniffi::export]

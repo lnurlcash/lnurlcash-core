@@ -26,12 +26,13 @@ protocol::parse_mutation(&Value, MutationKind, &request.outputs, Policy)
   -> MutationResponse. outputs = what the rotate/split/merge named, recorded
   on the Request: [output], or [output, change] for a split. A cp1 output is
   owed its cs1 in sig (sig2 for a split's change) ALWAYS, whatever the
-  policy; without it the mutation is Unverifiable. A plain hash output is
-  unsigned by design (LUD-25 Part 2 certifies cp1 notes only): signature
-  None, no error. A missing output reads as a hash. MutationKind::{Melt,
+  policy; without it the mutation is Unverifiable. A legacy hash output uses
+  a raw Part 1 signature when available; the tolerant default admits None in
+  no-signer mode. A missing output reads as a hash. MutationKind::{Melt,
   Rotate,Split,Merge} - a melt mints nothing and owes none.
 protocol::Policy { require_signatures, require_mint_pubkey }  defaults false
-  and true. require_signatures also demands the old Part 1 sig over a hash
+  and true. require_signatures demands the raw Part 1 sig over a hash,
+  matching the committed reference wallet
   output. require_mint_pubkey refuses a withdrawRequest with no valid
   mintPubkey; off only for a Part 1-only mint. Build with ..Policy::default().
 protocol::pay_request_request / invoice_request / verify_request + parse_*
@@ -100,6 +101,9 @@ derive_nostr_cash_seed(sk) / derive_nostr_address_node(sk, host)   NOT
 resolve_note_input / resolve_mint_input / resolve_lnurl_input
 parse_mint_fee / apply_mint_fee / gross_up_for_mint_fee
 build_note_url / with_new_k1 / without_k1
+address_proof_digest(action, username) / sign_address_proof(index_zero_sk, action, username)
+  exact message: LNURLcash:<register|unregister>:<normalised username>
+  wire signature: raw r || s || recovery-id; key is address branch index 0
 decode_bolt11_amount_msat / is_bolt11_invoice / same_invoice
 
 client::Client::{fetch_note_info, rotate_note, split_note, merge_notes,

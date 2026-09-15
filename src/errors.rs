@@ -87,8 +87,8 @@ pub enum Error {
     ///
     /// Raised for a `cp1` output whatever the policy says, and for a plain
     /// hash output only when [`crate::protocol::Policy::require_signatures`]
-    /// asks for the old Part 1 signature over it. A plain note is unsigned by
-    /// design, so by default a hash output never raises this.
+    /// asks for the raw Part 1 signature over it. The tolerant default admits
+    /// the reference mint's no-signer mode.
     #[error("{message}")]
     Unverifiable {
         message: String,

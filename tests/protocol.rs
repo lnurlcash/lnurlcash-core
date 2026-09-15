@@ -627,14 +627,13 @@ async fn reads_an_advertised_fee() {
     assert_eq!(fee.fee_ppm, 2000);
 }
 
-// ---- a plain note is unsigned ----
+// ---- a no-signer legacy mint is tolerated ----
 
-/// LUD-25 Part 2 certifies cp1 notes only: a hash has nothing to attest to
-/// without disclosing the secret behind it. So a mint answering a plain
-/// rotate or split with a bare OK is following the spec, and the notes come
-/// back unsigned - which is what a plain note is.
+/// A reference mint without a signer can confirm a legacy rotate or split
+/// without returning the raw Part 1 proof. The tolerant policy preserves the
+/// landed outputs; strict reference-wallet parity is tested below.
 #[tokio::test]
-async fn an_unsigned_plain_note_is_the_spec_not_a_fault() {
+async fn a_no_signer_legacy_mint_is_tolerated_by_default() {
     let mint = mint_or_skip!(&["--signatures=false"]);
     let client = Client::new();
     let k1 = secret(29);
@@ -659,8 +658,8 @@ async fn an_unsigned_plain_note_is_the_spec_not_a_fault() {
     );
 }
 
-/// A caller who still wants the old Part 1 signature over the hash can ask
-/// for it. The refusal has to be the loud kind - but the rotate LANDED, and
+/// A caller matching the committed reference wallet asks for the raw Part 1
+/// signature over the hash. The refusal has to be the loud kind - but the rotate LANDED, and
 /// the fresh secret is the only key to the note it minted, so the error
 /// carries it out. Refusing without it would be this crate destroying real
 /// money to make a point about a signature.
