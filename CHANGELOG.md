@@ -178,7 +178,7 @@ which the reference mint publishes and this dropped. All three cross the FFI on
 First release. A Rust implementation of LNURLcash, following the protocol layer
 of dni's [lnurl-wallet](https://github.com/dni/lnurl-wallet) and checked against
 the shared
-[conformance vectors](https://github.com/TheCryptoDonkey/lnurlcash-conformance)
+[conformance vectors](https://github.com/lnurlcash/lnurlcash-conformance)
 and the adversarial mock mint.
 
 ### Design notes

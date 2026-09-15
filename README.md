@@ -144,7 +144,7 @@ there is nothing to gain from it — the interesting part of LNURLcash is not th
 GET, it is knowing what a response means and which secrets must survive a
 failure. Both of those are pure functions.
 
-[lnurlcash-kotlin](https://github.com/TheCryptoDonkey/lnurlcash-kotlin) wraps
+[lnurlcash-kotlin](https://github.com/lnurlcash/lnurlcash-kotlin) wraps
 the generated Kotlin in something idiomatic.
 
 ## Two things ports get wrong
@@ -265,7 +265,7 @@ Integers in milli-satoshis, everywhere, with no exceptions.
 ## Conformance
 
 Tested against
-[lnurlcash-conformance](https://github.com/TheCryptoDonkey/lnurlcash-conformance):
+[lnurlcash-conformance](https://github.com/lnurlcash/lnurlcash-conformance):
 language-neutral vectors plus a mock mint that can be told to drop a connection
 mid-mutation, sign in the wrong byte order, lie about a note's value, or never
 settle a melt.
@@ -281,7 +281,7 @@ Both by dni, both MIT:
 [lnurl-wallet](https://github.com/dni/lnurl-wallet) (the wallet).
 
 The wider ecosystem — wallets, mints, hardware and the sibling ports — is
-indexed in [awesome-lnurlcash](https://github.com/TheCryptoDonkey/awesome-lnurlcash).
+indexed in [awesome-lnurlcash](https://github.com/lnurlcash/awesome-lnurlcash).
 
 ## License
 
