@@ -13,7 +13,7 @@ use lnurlcash_core::protocol::{
     split_request_with_hash, MutationKind, Policy,
 };
 use lnurlcash_core::recoverable::{
-    decode_ck1, encode_ck1, encode_cp1, encode_cs1, recover_note_ownership_pubkey,
+    decode_ck1, encode_ck1, encode_cp1, encode_cs1_with_amount, recover_note_ownership_pubkey,
     sign_note_ownership,
 };
 use lnurlcash_core::{
@@ -41,7 +41,7 @@ fn part2_note(fill: u8) -> Part2Note {
         cp1: encode_cp1(&pubkey),
         ck1: encode_ck1(&signature),
         // the same 65 bytes under the certificate's prefix
-        cs1_shaped: encode_cs1(&signature),
+        cs1_shaped: encode_cs1_with_amount(21_000, &signature),
     }
 }
 
@@ -280,10 +280,10 @@ fn a_merge_takes_a_part1_secret_and_a_part2_note_together() {
 
 // ---- what a response owes each output ----
 //
-// LUD-25 Part 2 certifies cp1 notes only. A cp1 output is owed its cs1, in
-// `sig` or in `sig2` for a split's change, whatever the policy says; a hash
-// output is a plain note, unsigned by design. The request records which it
-// named, and the parser reads that back rather than being told separately.
+// A cp1 output is owed its amount-bearing cs1, in `sig` or in `sig2` for a
+// split's change, whatever the policy says. A legacy hash uses the raw Part 1
+// signature when available and may be unsigned in no-signer mode. The request
+// records which it named, and the parser reads that back.
 
 #[test]
 fn a_request_records_the_outputs_it_named() {
@@ -390,8 +390,8 @@ fn a_cp1_change_is_owed_its_certificate_in_sig2() {
     let hash = hash_k1(&k1()).expect("hash");
     let request = split_request_with_hash(CB, &[k1()], 5_000, &hash, &b.cp1).expect("builds");
 
-    // the first output is a plain note: unsigned, or carrying a Part 1
-    // signature, and neither excuses the change
+    // the first output is a legacy hash note: it may be unsigned in no-signer
+    // mode or carry a raw Part 1 signature, and neither excuses the change
     for body in [
         json!({"status": "OK"}),
         json!({"status": "OK", "sig": "ab".repeat(65)}),

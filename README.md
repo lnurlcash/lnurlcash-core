@@ -99,17 +99,17 @@ operation and the caller never sees an error at all
 `pr`, is paid asynchronously and has no replay guarantee; and never a
 definitive refusal, which is the service's considered answer.
 
-**2b. A plain note is unsigned; a `cp1` note is not.** LUD-25 Part 2
-certifies `cp1` notes only, because a hash has nothing to attest to without
-disclosing the secret. So a rotate, split or merge to a hash output comes back
-with `signature` set to `None`, and that is the spec, not a fault. A `cp1`
-output is owed its `cs1` certificate whatever the policy says: one that comes
-back without it raises `Error::Unverifiable`, which **carries the fresh
-secrets**, because the mutation landed and the note is real. Hand
-`parse_mutation` the request's `outputs` so it knows which kind it asked for.
+**2b. Legacy hashes and `cp1` outputs use different proof formats.** The
+reference mint returns a raw Part 1 signature for a hash output when a signer
+is available, and an amount-bearing `cs1` for a `cp1` output. It may omit the
+legacy signature in no-signer mode; this crate accepts that compatibility mode
+by default, while a missing `cs1` always raises `Error::Unverifiable`. That
+error **carries the fresh secrets**, because the mutation landed and the note
+is real. Hand `parse_mutation` the request's `outputs` so it knows which kind
+it asked for.
 
-`Policy { require_signatures: true, ..Policy::default() }` also demands the
-old Part 1 signature over a hash, as mints did before the Part 2 rewrite.
+`Policy { require_signatures: true, ..Policy::default() }` demands the raw
+Part 1 signature over a hash, matching the committed reference wallet.
 `parse_note_info` refuses a `withdrawRequest` without a valid `mintPubkey`;
 `Policy { require_mint_pubkey: false, ..Policy::default() }` admits a Part
 1-only mint that publishes none. If you want a note a recipient can check
@@ -198,9 +198,9 @@ A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`, and the
 mint only ever sees `pk`, written `cp1...`. To spend the note you hand over
 `ck1...`, a recoverable signature by `sk` over the fixed message `LNURLcash`,
 and the mint recovers `pk` from it to find the note. The mint's certificate,
-`cs1...`, is the same signature mints already make, over `hex(pk)` instead of a
-hash. So a recipient can check a note offline with nothing but its `ck1` and
-`cs1`.
+`cs1...`, carries the amount in its human-readable part and the mint's
+signature over that amount and `hex(pk)`. So a recipient can check a note
+offline with nothing but its `ck1` and `cs1`.
 
 ```rust
 use lnurlcash_core::cash::derive_cash_root;
@@ -215,8 +215,22 @@ let pk = derive_note_pubkey(&branch.pubkey_x_only, &branch.chain_code, i)?; // w
 let sk = derive_note_secret_key(&node.private_key, &node.chain_code, i)?;
 let ck1 = encode_ck1(&sign_note_ownership(&sk)?); // the bearer secret
 
+let cs1 = encode_cs1_with_amount(amount_msat, &mint_signature);
+let certificate = decode_cs1_with_amount(&cs1).expect("current certificate");
+assert_eq!(certificate.amount_msat, amount_msat);
+
 verify_note_signature(&ck1, amount_msat, &cs1, &mint_pubkey); // offline
 ```
+
+The fixed-HRP `encode_cs1`/`decode_cs1` functions remain available for notes
+created before the amount-bearing form. New issuance uses the explicit
+`*_with_amount` functions; `decode_any_cs1` accepts either during migration.
+
+Registering, updating or unregistering a reference-mint Lightning Address
+uses the branch's index-0 private key. `sign_address_proof(&sk0, action,
+username)` returns the raw `r || s || recovery-id` proof over
+`LNURLcash:<action>:<username>`; action is `register` or `unregister`, and the
+username must be normalised exactly as it is sent to the service.
 
 The wire takes both kinds. A `ck1` goes anywhere a k1 does. A `cp1` goes
 anywhere an output does: `mint_invoice_request_with_hash` sends it as the

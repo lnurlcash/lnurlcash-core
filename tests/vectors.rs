@@ -17,20 +17,21 @@ use lnurlcash_core::protocol::{
     MutationResponse, Policy, Request,
 };
 use lnurlcash_core::recoverable::{
-    cash_node_to_cx1, decode_ck1, decode_cp1, decode_cs1, decode_cx1, derive_cash_address_node,
-    derive_nostr_address_node, derive_nostr_cash_seed, derive_note_pubkey, derive_note_secret_key,
-    encode_ck1, encode_cp1, encode_cs1, encode_cx1, is_ck1, is_cp1, is_cs1, is_cx1,
-    note_ownership_digest, recover_note_ownership_pubkey, sign_note_ownership,
-    NOSTR_CASH_SEED_LABEL,
+    cash_node_to_cx1, decode_ck1, decode_cp1, decode_cs1_with_amount, decode_cx1,
+    derive_cash_address_node, derive_nostr_address_node, derive_nostr_cash_seed,
+    derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1, encode_cs1_with_amount,
+    encode_cx1, is_ck1, is_cp1, is_cs1_with_amount, is_cx1, note_ownership_digest,
+    recover_note_ownership_pubkey, sign_note_ownership, NOSTR_CASH_SEED_LABEL,
 };
 use lnurlcash_core::secrets::{derive_note_root, derive_note_secret};
 use lnurlcash_core::{
-    apply_mint_fee, build_note_url, decode_bolt11_amount_msat, format_fee_percent,
-    from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url, is_bolt11_invoice,
-    is_preimage, lightning_address_username, mint_address_url, note_declared_amount, note_id_of,
-    note_k1, note_lookup_of, note_signature, note_signature_digest, note_signature_digest_for_hash,
-    note_signature_message, note_signature_message_for_hash, parse_mint_fee, resolve_lnurl_input,
-    resolve_mint_input, resolve_note_input, same_invoice, to_bech32_lnurl, verify_note_signature,
+    address_proof_digest, apply_mint_fee, build_note_url, decode_bolt11_amount_msat,
+    format_fee_percent, from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url,
+    is_bolt11_invoice, is_preimage, lightning_address_username, mint_address_url,
+    note_declared_amount, note_id_of, note_k1, note_lookup_of, note_signature,
+    note_signature_digest, note_signature_digest_for_hash, note_signature_message,
+    note_signature_message_for_hash, parse_mint_fee, resolve_lnurl_input, resolve_mint_input,
+    resolve_note_input, same_invoice, sign_address_proof, to_bech32_lnurl, verify_note_signature,
     verify_note_signature_hash, with_new_k1, without_k1, MintFee,
 };
 use lnurlcash_core::{hash_k1, Error};
@@ -488,7 +489,8 @@ fn pay_request_vectors() {
 // responses.json says which call each case goes through (`op`) and, since
 // 0.10.0, which kind of note it mints: `output: "cp1"` or `change: "cp1"`,
 // and a plain hash wherever neither is said. A `cp1` output is owed a `cs1`
-// certificate; a hash output is owed nothing, and a bare OK to one is `ok`.
+// certificate; a legacy hash may carry a raw Part 1 signature, while a bare
+// OK is accepted only by the default no-signer-compatible policy.
 //
 // This grades every case that carries a JSON answer, through the same request
 // builders and parser a caller uses, with the default policy. The rest carry
@@ -1031,6 +1033,27 @@ fn part2_branch_vectors() {
 }
 
 #[test]
+fn address_proof_vectors() {
+    let vectors = load("part2.json");
+    for proof in vectors["addressProofs"].as_array().expect("addressProofs") {
+        let action = str_of(proof, "action");
+        let username = str_of(proof, "username");
+        assert_eq!(
+            hex::encode(address_proof_digest(&action, &username).expect("valid action")),
+            str_of(proof, "digest")
+        );
+        assert_eq!(
+            hex::encode(
+                sign_address_proof(&bytes32(proof, "indexZeroSecretKey"), &action, &username)
+                    .expect("signs")
+            ),
+            str_of(proof, "signature")
+        );
+    }
+    assert!(address_proof_digest("delete", "alice").is_err());
+}
+
+#[test]
 fn part2_certificate_vectors() {
     let vectors = load("part2.json");
     let mint = &vectors["mint"];
@@ -1092,8 +1115,10 @@ fn part2_certificate_vectors() {
             .try_into()
             .expect("65 bytes");
         let cs1 = str_of(certificate, "cs1");
-        assert_eq!(encode_cs1(&signature), cs1, "{at}");
-        assert_eq!(decode_cs1(&cs1), Some(signature), "{at}");
+        assert_eq!(encode_cs1_with_amount(amount, &signature), cs1, "{at}");
+        let decoded = decode_cs1_with_amount(&cs1).unwrap_or_else(|| panic!("{at}: cs1 decodes"));
+        assert_eq!(decoded.amount_msat, amount, "{at}");
+        assert_eq!(decoded.signature, signature, "{at}");
 
         // RFC6979 on the mint's side too: its key over the digest reproduces
         // the certificate
@@ -1151,7 +1176,10 @@ fn part2_string_vectors() {
         let (decoded, is) = match kind {
             "cp1" => (decode_cp1(value).map(hex::encode), is_cp1(value)),
             "ck1" => (decode_ck1(value).map(hex::encode), is_ck1(value)),
-            "cs1" => (decode_cs1(value).map(hex::encode), is_cs1(value)),
+            "cs1" => (
+                decode_cs1_with_amount(value).map(|cs1| hex::encode(cs1.signature)),
+                is_cs1_with_amount(value),
+            ),
             "cx1" => (
                 decode_cx1(value).map(|cx1| {
                     format!(

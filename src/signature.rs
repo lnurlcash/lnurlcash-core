@@ -21,13 +21,51 @@
 //! note - without revealing what would let anyone spend it.
 
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-use secp256k1::{Message, Secp256k1};
+use secp256k1::{Message, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 
-use crate::recoverable::{decode_cs1, note_id_of};
+use crate::recoverable::{decode_any_cs1, note_id_of};
 
 const LIGHTNING_SIGNED_MESSAGE_PREFIX: &[u8] = b"Lightning Signed Message:";
 const DOMAIN_TAG: &str = "LNURLcash";
+
+fn address_proof_message(action: &str, username: &str) -> crate::Result<String> {
+    if action != "register" && action != "unregister" {
+        return Err(crate::Error::Protocol(
+            "an address proof action is register or unregister".into(),
+        ));
+    }
+    Ok(format!("{DOMAIN_TAG}:{action}:{username}"))
+}
+
+/// The action- and username-bound digest used to prove control of a registered
+/// address's index-0 branch key. The caller must use the same normalised
+/// username it sends to the SERVICE.
+pub fn address_proof_digest(action: &str, username: &str) -> crate::Result<[u8; 32]> {
+    Ok(lightning_signed_digest(&address_proof_message(
+        action, username,
+    )?))
+}
+
+/// Sign a register/update or unregister proof as raw `r || s || recovery-id`.
+pub fn sign_address_proof(
+    index_zero_secret_key: &[u8; 32],
+    action: &str,
+    username: &str,
+) -> crate::Result<[u8; 65]> {
+    let key = SecretKey::from_slice(index_zero_secret_key).map_err(|_| {
+        crate::Error::Protocol("an index-zero secret key is a 32-byte scalar in [1, n)".into())
+    })?;
+    let signature = Secp256k1::signing_only().sign_ecdsa_recoverable(
+        &Message::from_digest(address_proof_digest(action, username)?),
+        &key,
+    );
+    let (recovery, compact) = signature.serialize_compact();
+    let mut out = [0u8; 65];
+    out[..64].copy_from_slice(&compact);
+    out[64] = recovery.to_i32() as u8;
+    Ok(out)
+}
 
 /// What a Lightning node's signmessage puts its pen to, and so what every
 /// LNURLcash signature is made over, a Part 2 ownership proof included.
@@ -70,8 +108,9 @@ pub fn note_signature_digest_for_hash(h: &str, amount_msat: u64) -> [u8; 32] {
 ///
 /// `k1` is a Part 1 secret or a Part 2 `ck1`; a `ck1`'s id is the key it
 /// recovers to, found locally, so checking one needs no network either.
-/// `signature_hex` is 65 bytes of hex, or a Part 2 `cs1`, which is the same
-/// 65 bytes encoded.
+/// `signature_hex` is 65 bytes of hex, or either form of Part 2 `cs1`.
+/// Amount-bearing certificates can be decoded separately when the caller
+/// needs the amount carried on the wire.
 ///
 /// Which end of those bytes carries the recovery id varies by implementation:
 /// LUD-25 calls for `r || s || recovery_id`, the layout raw BOLT-11 signatures
@@ -110,8 +149,8 @@ pub fn verify_note_signature_hash(
     if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }
-    let signature = match decode_cs1(signature_hex) {
-        Some(certificate) => certificate.to_vec(),
+    let signature = match decode_any_cs1(signature_hex) {
+        Some(signature) => signature.to_vec(),
         None => match hex::decode(signature_hex.trim()) {
             Ok(bytes) => bytes,
             Err(_) => return false,
