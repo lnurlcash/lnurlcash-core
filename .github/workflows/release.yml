@@ -59,19 +59,22 @@ jobs:
         with:
           repository: lnurlcash/lnurlcash-conformance
           ref: v0.11.0
-          path: conformance
+          # Keep the auxiliary checkout under Cargo's ignored build tree.
+          # A sibling at the repository root is seen as uncommitted package
+          # content and makes `cargo publish` refuse an otherwise clean tag.
+          path: target/conformance
           persist-credentials: false
 
       - name: Install mock-mint dependencies
         run: npm ci
-        working-directory: conformance
+        working-directory: target/conformance
 
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - name: Test against the pinned conformance suite
         run: cargo test --locked --all-features
         env:
-          LNURLCASH_CONFORMANCE: ${{ github.workspace }}/conformance
+          LNURLCASH_CONFORMANCE: ${{ github.workspace }}/target/conformance
       - run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
