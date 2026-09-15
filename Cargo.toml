@@ -11,6 +11,7 @@ documentation = "https://docs.rs/lnurlcash-core"
 readme = "README.md"
 keywords = ["lnurl", "lightning", "bitcoin", "lnurlcash", "bearer"]
 categories = ["cryptography::cryptocurrencies", "api-bindings"]
+publish = ["crates-io"]
 exclude = ["/.github", "/tests"]
 
 [lib]
