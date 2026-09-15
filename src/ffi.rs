@@ -514,18 +514,18 @@ pub fn is_cp1(value: &str) -> bool {
     recoverable::is_cp1(value)
 }
 
-/// A 65-byte ownership signature as a `ck1`: the string that spends the note.
+/// A 96-byte pubkey-plus-Schnorr-signature payload as a `ck1`.
 #[uniffi::export]
 pub fn encode_ck1(signature_hex: &str) -> FfiResult<String> {
     Ok(recoverable::encode_ck1(&hex_array(
         signature_hex,
-        "an ownership signature",
+        "an ownership payload",
     )?))
 }
 
 #[uniffi::export]
 pub fn decode_ck1(value: &str) -> Option<String> {
-    recoverable::decode_ck1(value).map(hex::encode)
+    recoverable::decode_ck1(value).map(|decoded| hex::encode(decoded.as_bytes()))
 }
 
 #[uniffi::export]
@@ -630,7 +630,7 @@ pub fn derive_note_secret_key(
     )?))
 }
 
-/// The raw 65-byte ownership signature, as hex. [`encode_ck1`] it for the
+/// The raw 96-byte pubkey-plus-Schnorr-signature payload, as hex. [`encode_ck1`] it for the
 /// wire; either way, it spends the note.
 #[uniffi::export]
 pub fn sign_note_ownership(secret_key_hex: &str) -> FfiResult<String> {
@@ -641,7 +641,7 @@ pub fn sign_note_ownership(secret_key_hex: &str) -> FfiResult<String> {
 }
 
 /// A register/update or unregister proof by the branch's index-0 key, as raw
-/// `r || s || recovery-id` hex.
+/// 64-byte BIP-340 Schnorr signature hex.
 #[uniffi::export]
 pub fn sign_address_proof(
     index_zero_secret_key_hex: &str,
@@ -662,7 +662,7 @@ pub fn recover_note_ownership_pubkey(signature_hex: &str) -> Option<String> {
 }
 
 /// The id a SERVICE files a note under: sha256(k1) for a secret, the
-/// recovered key for a `ck1`. Compare notes by this, never by k1.
+/// verified embedded key for a `ck1`. Compare notes by this, never by k1.
 #[uniffi::export]
 pub fn note_id_of(k1: &str) -> Option<String> {
     recoverable::note_id_of(k1)

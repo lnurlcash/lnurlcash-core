@@ -3,6 +3,27 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
+## Unreleased
+
+### BIP-340 wallet ownership proofs
+
+- Follow the revised LUD-25 `ck1` format: a 96-byte payload containing the
+  32-byte x-only note key and a 64-byte BIP-340 signature over the raw UTF-8
+  message `LNURLcash`. `cs1` remains recoverable ECDSA and is unchanged.
+- `sign_note_ownership` now returns that complete 96-byte payload;
+  `recover_note_ownership_pubkey` verifies the embedded signature before
+  returning its key. `encode_ck1` now requires the 96-byte current payload.
+- `decode_ck1`, `is_ck1`, note lookup and verification continue accepting the
+  old 65-byte recoverable-ECDSA form so existing bearer notes can be rotated;
+  `DecodedCk1` marks which shape was read. New signing and encoding only emit
+  the Schnorr form.
+- Replace `note_ownership_digest` with `note_ownership_message` and replace
+  `address_proof_digest` with `address_proof_message`. The existing reference
+  address helper now produces a 64-byte BIP-340 signature over its raw UTF-8
+  message.
+- Grade the implementation byte-for-byte against the Schnorr conformance
+  vectors shared with the TypeScript wallet and Python mint.
+
 ## 0.1.0 — 2026-09-15
 
 ### Reference address proofs and compact note URLs

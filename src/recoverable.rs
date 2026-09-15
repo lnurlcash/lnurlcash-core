@@ -1,10 +1,9 @@
-//! LUD-25 Part 2: notes keyed by a public key and spent by a recoverable
-//! signature.
+//! LUD-25 Part 2: notes keyed by a public key and spent by a Schnorr proof.
 //!
 //! A Part 2 note is filed under a public key rather than a hash. The holder
 //! keeps `sk`, discloses `pk` as `cp1<pk>`, and spends the note with `ck1`, a
-//! recoverable signature by `sk` over a fixed message: the SERVICE recovers
-//! `pk` from it and looks the note up. The SERVICE certifies each note with
+//! BIP-340 signature by `sk` over a fixed message, paired with `pk`: the
+//! SERVICE verifies the pair and looks the note up by `pk`. It certifies each note with
 //! `cs1`, the same signature it has always made, over `hex(pk)` instead of a
 //! hash. Its human-readable part also carries the signed amount using BOLT-11
 //! amount rules, so a recipient can check issuance offline with nothing but
@@ -16,6 +15,7 @@
 
 use bech32::{FromBase32, ToBase32, Variant};
 use hmac::{Hmac, Mac};
+use k256::schnorr::{Signature as SchnorrSignature, SigningKey, VerifyingKey};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::{Keypair, Message, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
@@ -66,14 +66,33 @@ pub fn is_cp1(value: &str) -> bool {
     decode_cp1(value).is_some()
 }
 
-/// A note's bearer secret: the 65-byte `r || s || recovery id` ownership
-/// signature, as a `ck1`. Whoever has it can spend the note.
-pub fn encode_ck1(signature: &[u8; 65]) -> String {
-    encode_fixed("ck", signature)
+/// A note's bearer secret: its 32-byte x-only public key followed by its
+/// 64-byte BIP-340 signature, as a `ck1`. Whoever has it can spend the note.
+pub fn encode_ck1(payload: &[u8; 96]) -> String {
+    encode_fixed("ck", payload)
 }
 
-pub fn decode_ck1(value: &str) -> Option<[u8; 65]> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedCk1 {
+    Current([u8; 96]),
+    /// Pre-Schnorr recoverable-ECDSA bearer, accepted only so existing notes
+    /// remain spendable long enough to rotate into the current format.
+    Legacy([u8; 65]),
+}
+
+impl DecodedCk1 {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Current(payload) => payload,
+            Self::Legacy(signature) => signature,
+        }
+    }
+}
+
+pub fn decode_ck1(value: &str) -> Option<DecodedCk1> {
     decode_fixed("ck", value)
+        .map(DecodedCk1::Current)
+        .or_else(|| decode_fixed("ck", value).map(DecodedCk1::Legacy))
 }
 
 pub fn is_ck1(value: &str) -> bool {
@@ -293,75 +312,69 @@ pub fn derive_note_secret_key(
 
 // ---- ownership proofs ----
 //
-//   message = "LNURLcash"
-//   digest  = sha256(sha256("Lightning Signed Message:" || message))
+//   sig = BIP340.Sign(sk, "LNURLcash")
+//   ck1 = bech32m("ck", pk || sig)
 //
-// One fixed message for every note, so the value submitted to spend a note is
-// the value shown to prove it, and RFC6979 makes it deterministic: re-deriving
-// a key reproduces its `ck1` byte for byte. Deterministic is not unique,
-// though. The high-S twin of a signature recovers to the same key, so one
-// note has more than one valid `ck1` string, which is why notes are compared
-// by [`note_id_of`] and never by k1.
+// One fixed message and fixed all-zero BIP-340 auxiliary input make the bearer
+// value deterministic: re-deriving a key reproduces its one `ck1` byte for byte.
 
-const NOTE_OWNERSHIP_MESSAGE: &str = "LNURLcash";
+const NOTE_OWNERSHIP_MESSAGE: &[u8] = b"LNURLcash";
+const LEGACY_NOTE_OWNERSHIP_MESSAGE: &str = "LNURLcash";
 
-/// The digest every ownership signature is made over. Public because
-/// conformance pins it, and a signer that holds note keys needs nothing else.
-pub fn note_ownership_digest() -> [u8; 32] {
-    lightning_signed_digest(NOTE_OWNERSHIP_MESSAGE)
+/// The raw message every ownership signature is made over.
+pub fn note_ownership_message() -> &'static [u8] {
+    NOTE_OWNERSHIP_MESSAGE
 }
 
-/// The raw 65-byte ownership signature, `r || s || recovery id`. Encode it
-/// with [`encode_ck1`] for the wire: that string spends the note, so it is as
-/// secret as the key that made it.
-pub fn sign_note_ownership(secret_key: &[u8; 32]) -> Result<[u8; 65]> {
-    let secp = Secp256k1::signing_only();
-    let key = SecretKey::from_slice(secret_key)
+/// The 96-byte `pk || sig` ownership payload. Encode it with [`encode_ck1`]
+/// for the wire: that string spends the note, so it is as secret as the key.
+pub fn sign_note_ownership(secret_key: &[u8; 32]) -> Result<[u8; 96]> {
+    let key = SigningKey::from_bytes(secret_key)
         .map_err(|_| Error::Protocol("a note secret key is a 32-byte scalar in [1, n)".into()))?;
-    // libsecp256k1 draws its nonce by RFC6979 and always normalises to low S
-    let signature =
-        secp.sign_ecdsa_recoverable(&Message::from_digest(note_ownership_digest()), &key);
-    let (recovery, compact) = signature.serialize_compact();
-    let mut out = [0u8; 65];
-    out[..64].copy_from_slice(&compact);
-    // the library hands the recovery id back separately; the wire puts it last
-    out[64] = recovery.to_i32() as u8;
+    let signature = key
+        .sign_raw(NOTE_OWNERSHIP_MESSAGE, &[0u8; 32])
+        .map_err(|_| Error::Protocol("could not sign the note ownership message".into()))?;
+    let mut out = [0u8; 96];
+    out[..32].copy_from_slice(&key.verifying_key().to_bytes());
+    out[32..].copy_from_slice(signature.to_bytes().as_ref());
     Ok(out)
 }
 
-/// The note's x-only public key, recovered offline from its ownership
-/// signature. `None` for anything that does not recover, the wrong length
-/// included.
-///
-/// Only the wire layout, `r || s || recovery id`, is tried. Unlike a
-/// certificate, a `ck1` is a new encoding with no older byte order out there
-/// to be lenient about.
-pub fn recover_note_ownership_pubkey(signature: &[u8]) -> Option<[u8; 32]> {
-    if signature.len() != 65 {
+/// Validate a `pk || sig` ownership payload and return its embedded x-only
+/// public key. `None` for an invalid proof or wrong length.
+pub fn recover_note_ownership_pubkey(payload: &[u8]) -> Option<[u8; 32]> {
+    if payload.len() == 96 {
+        let key = VerifyingKey::from_bytes(&payload[..32]).ok()?;
+        let signature = SchnorrSignature::try_from(&payload[32..]).ok()?;
+        key.verify_raw(NOTE_OWNERSHIP_MESSAGE, &signature).ok()?;
+        return payload[..32].try_into().ok();
+    }
+    if payload.len() != 65 {
         return None;
     }
-    let id = RecoveryId::from_i32(i32::from(signature[64])).ok()?;
-    let recoverable = RecoverableSignature::from_compact(&signature[..64], id).ok()?;
-    let secp = Secp256k1::verification_only();
-    let key = secp
-        .recover_ecdsa(&Message::from_digest(note_ownership_digest()), &recoverable)
+    let recovery = RecoveryId::from_i32(i32::from(payload[64])).ok()?;
+    let signature = RecoverableSignature::from_compact(&payload[..64], recovery).ok()?;
+    let key = Secp256k1::verification_only()
+        .recover_ecdsa(
+            &Message::from_digest(lightning_signed_digest(LEGACY_NOTE_OWNERSHIP_MESSAGE)),
+            &signature,
+        )
         .ok()?;
     Some(key.x_only_public_key().0.serialize())
 }
 
 // ---- a note's k1, either kind ----
 
-/// The key a `ck1` recovers to, from a k1 already trimmed and lowercased.
+/// The verified key embedded in a `ck1`, from a k1 already trimmed and lowercased.
 fn part2_key_of(value: &str) -> Option<[u8; 32]> {
-    recover_note_ownership_pubkey(&decode_ck1(value)?)
+    recover_note_ownership_pubkey(decode_ck1(value)?.as_bytes())
 }
 
 /// The id a SERVICE files a note under: sha256(k1) as hex for a Part 1 secret,
-/// the recovered public key as hex for a Part 2 `ck1`, and `None` for anything
-/// else, a `ck1` that does not recover included.
+/// the verified public key as hex for a Part 2 `ck1`, and `None` for anything
+/// else, an invalid `ck1` included.
 ///
-/// Compare notes by this, never by k1. Two different `ck1` strings can share
-/// an id, and a WALLET deduplicating by string would hold one note twice.
+/// Compare notes by this, never by an unverified payload.
 ///
 /// The k1 is lowercased first, the way [`crate::note::note_k1`] normalises
 /// every k1, so casing never makes one note into two.
@@ -465,12 +478,12 @@ mod tests {
     }
 
     fn samples() -> [(&'static str, String); 4] {
-        let signature = sign_note_ownership(&[0x11; 32]).expect("a valid key");
-        let pubkey = recover_note_ownership_pubkey(&signature).expect("recovers");
+        let ownership = sign_note_ownership(&[0x11; 32]).expect("a valid key");
+        let pubkey = recover_note_ownership_pubkey(&ownership).expect("verifies");
         [
             ("cp", encode_cp1(&pubkey)),
-            ("ck", encode_ck1(&signature)),
-            ("cs", encode_cs1_with_amount(21_000, &signature)),
+            ("ck", encode_ck1(&ownership)),
+            ("cs", encode_cs1_with_amount(21_000, &[0x33; 65])),
             ("cx", encode_cx1(&pubkey, &[0x22; 32])),
         ]
     }
@@ -516,10 +529,10 @@ mod tests {
 
     #[test]
     fn non_zero_padding_is_refused() {
-        // 32 and 64 bytes leave spare bits in the last five-bit group, which
-        // must be zero. 65 bytes fill theirs exactly, so ck1 and cs1 have none.
+        // 32, 64 and 96 bytes leave spare bits in the last five-bit group,
+        // which must be zero. 65-byte cs1 fills its groups exactly.
         for (hrp, value) in samples() {
-            if hrp == "ck" || hrp == "cs" {
+            if hrp == "cs" {
                 continue;
             }
             let (_, mut words) = words_of(&value);
@@ -555,7 +568,7 @@ mod tests {
             assert_eq!(note_lookup_of(value), None);
         }
         assert_eq!(recover_note_ownership_pubkey(&[]), None);
-        assert_eq!(recover_note_ownership_pubkey(&[0xff; 65]), None);
+        assert_eq!(recover_note_ownership_pubkey(&[0xff; 96]), None);
     }
 
     #[test]
@@ -576,24 +589,41 @@ mod tests {
     fn a_truncated_or_corrupted_signature_is_not_the_note() {
         let signature = sign_note_ownership(&[0x11; 32]).expect("a valid key");
         let pubkey = recover_note_ownership_pubkey(&signature);
-        assert_eq!(recover_note_ownership_pubkey(&signature[..64]), None);
+        assert_eq!(recover_note_ownership_pubkey(&signature[..95]), None);
         let mut corrupted = signature;
         corrupted[10] ^= 0xff;
         assert_ne!(recover_note_ownership_pubkey(&corrupted), pubkey);
     }
 
     #[test]
-    fn one_note_has_more_than_one_ck1_so_notes_compare_by_id() {
-        let signature = sign_note_ownership(&[0x11; 32]).expect("a valid key");
-        // the high-S twin: s' = n - s, and the other recovery id
-        let s = SecretKey::from_slice(&signature[32..64]).expect("s is in [1, n)");
-        let mut twin = signature;
-        twin[32..64].copy_from_slice(&s.negate().secret_bytes());
-        twin[64] ^= 1;
-        let (a, b) = (encode_ck1(&signature), encode_ck1(&twin));
-        assert_ne!(a, b);
-        assert_eq!(note_id_of(&a), note_id_of(&b));
-        assert!(note_id_of(&a).is_some());
+    fn one_key_reproduces_one_ck1() {
+        let a = sign_note_ownership(&[0x11; 32]).expect("a valid key");
+        let b = sign_note_ownership(&[0x11; 32]).expect("a valid key");
+        assert_eq!(a, b);
+        assert_eq!(encode_ck1(&a), encode_ck1(&b));
+    }
+
+    #[test]
+    fn a_legacy_ck1_stays_readable_for_rotation() {
+        let secret = SecretKey::from_slice(&[0x11; 32]).expect("a valid key");
+        let signature = Secp256k1::signing_only().sign_ecdsa_recoverable(
+            &Message::from_digest(lightning_signed_digest(LEGACY_NOTE_OWNERSHIP_MESSAGE)),
+            &secret,
+        );
+        let (recovery, compact) = signature.serialize_compact();
+        let mut payload = [0u8; 65];
+        payload[..64].copy_from_slice(&compact);
+        payload[64] = recovery.to_i32() as u8;
+        let ck1 = encode_fixed("ck", &payload);
+
+        assert_eq!(decode_ck1(&ck1), Some(DecodedCk1::Legacy(payload)));
+        assert!(is_ck1(&ck1));
+        assert_eq!(
+            note_id_of(&ck1),
+            Some(hex::encode(
+                secret.x_only_public_key(&Secp256k1::new()).0.serialize()
+            ))
+        );
     }
 
     #[test]

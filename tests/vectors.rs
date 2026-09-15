@@ -20,12 +20,12 @@ use lnurlcash_core::recoverable::{
     cash_node_to_cx1, decode_ck1, decode_cp1, decode_cs1_with_amount, decode_cx1,
     derive_cash_address_node, derive_nostr_address_node, derive_nostr_cash_seed,
     derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1, encode_cs1_with_amount,
-    encode_cx1, is_ck1, is_cp1, is_cs1_with_amount, is_cx1, note_ownership_digest,
-    recover_note_ownership_pubkey, sign_note_ownership, NOSTR_CASH_SEED_LABEL,
+    encode_cx1, is_ck1, is_cp1, is_cs1_with_amount, is_cx1, note_ownership_message,
+    recover_note_ownership_pubkey, sign_note_ownership, DecodedCk1, NOSTR_CASH_SEED_LABEL,
 };
 use lnurlcash_core::secrets::{derive_note_root, derive_note_secret};
 use lnurlcash_core::{
-    address_proof_digest, apply_mint_fee, build_note_url, decode_bolt11_amount_msat,
+    address_proof_message, apply_mint_fee, build_note_url, decode_bolt11_amount_msat,
     format_fee_percent, from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url,
     is_bolt11_invoice, is_preimage, lightning_address_username, mint_address_url,
     note_declared_amount, note_id_of, note_k1, note_lookup_of, note_signature,
@@ -35,7 +35,7 @@ use lnurlcash_core::{
     verify_note_signature_hash, with_new_k1, without_k1, MintFee,
 };
 use lnurlcash_core::{hash_k1, Error};
-use secp256k1::{ecdsa, Message, Parity, PublicKey, Secp256k1, SecretKey};
+use secp256k1::{Message, Parity, PublicKey, Secp256k1, SecretKey};
 use serde_json::Value;
 
 fn vectors_dir() -> PathBuf {
@@ -886,13 +886,6 @@ fn parity_of(private_key: &[u8; 32]) -> &'static str {
     }
 }
 
-fn is_low_s(signature: &[u8; 65]) -> bool {
-    let original = ecdsa::Signature::from_compact(&signature[..64]).expect("r || s");
-    let mut normalised = original;
-    normalised.normalize_s();
-    normalised == original
-}
-
 #[test]
 fn part2_branch_vectors() {
     let vectors = load("part2.json");
@@ -911,10 +904,7 @@ fn part2_branch_vectors() {
         conventions["certificateMessage"].as_str(),
         Some("LNURLcash:<amount_msat>:<hex(pk)>")
     );
-    assert_eq!(
-        hex::encode(note_ownership_digest()),
-        str_of(conventions, "ownershipDigest")
-    );
+    assert_eq!(note_ownership_message(), b"LNURLcash");
 
     let branches = vectors["branches"].as_array().expect("branches");
     // An odd branch is the only thing that exercises the negation, and the
@@ -1006,23 +996,23 @@ fn part2_branch_vectors() {
                 .unwrap_or_else(|err| panic!("{at}: {err}"));
             assert_eq!(hex::encode(secret), str_of(note, "noteSecretKey"), "{at}");
 
-            // RFC6979: the same key reproduces the same ck1, byte for byte
-            let signature = sign_note_ownership(&secret).expect("signs");
+            // Fixed BIP-340 auxiliary input: the same key reproduces the same
+            // ck1 byte for byte for seed recovery.
+            let payload = sign_note_ownership(&secret).expect("signs");
+            assert_eq!(&payload[..32], &pubkey);
             assert_eq!(
-                hex::encode(signature),
+                hex::encode(&payload[32..]),
                 str_of(note, "ownershipSignature"),
                 "{at}"
             );
-            assert!(signature[64] <= 3, "{at}: recovery id");
-            assert!(is_low_s(&signature), "{at}: high S");
             let ck1 = str_of(note, "ck1");
-            assert_eq!(encode_ck1(&signature), ck1, "{at}");
-            assert_eq!(decode_ck1(&ck1), Some(signature), "{at}");
+            assert_eq!(encode_ck1(&payload), ck1, "{at}");
+            assert_eq!(decode_ck1(&ck1), Some(DecodedCk1::Current(payload)), "{at}");
 
             // the SERVICE's side: the ck1 alone gives the key the note is
             // filed under, which is also the one the watcher derived
             assert_eq!(
-                recover_note_ownership_pubkey(&signature),
+                recover_note_ownership_pubkey(&payload),
                 Some(pubkey),
                 "{at}"
             );
@@ -1039,8 +1029,8 @@ fn address_proof_vectors() {
         let action = str_of(proof, "action");
         let username = str_of(proof, "username");
         assert_eq!(
-            hex::encode(address_proof_digest(&action, &username).expect("valid action")),
-            str_of(proof, "digest")
+            address_proof_message(&action, &username).expect("valid action"),
+            str_of(proof, "message")
         );
         assert_eq!(
             hex::encode(
@@ -1050,7 +1040,7 @@ fn address_proof_vectors() {
             str_of(proof, "signature")
         );
     }
-    assert!(address_proof_digest("delete", "alice").is_err());
+    assert!(address_proof_message("delete", "alice").is_err());
 }
 
 #[test]
@@ -1175,7 +1165,10 @@ fn part2_string_vectors() {
     let decode = |kind: &str, value: &str| -> Option<String> {
         let (decoded, is) = match kind {
             "cp1" => (decode_cp1(value).map(hex::encode), is_cp1(value)),
-            "ck1" => (decode_ck1(value).map(hex::encode), is_ck1(value)),
+            "ck1" => (
+                decode_ck1(value).map(|decoded| hex::encode(decoded.as_bytes())),
+                is_ck1(value),
+            ),
             "cs1" => (
                 decode_cs1_with_amount(value).map(|cs1| hex::encode(cs1.signature)),
                 is_cs1_with_amount(value),

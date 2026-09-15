@@ -23,7 +23,7 @@
 //! ```
 //!
 //! A LUD-25 Part 2 note is keyed by a public key instead: its k1 is a `ck1`
-//! signature, and its output a `cp1` key sent as `p1`/`p2`. See
+//! containing that key and its Schnorr proof, and its output a `cp1` key sent as `p1`/`p2`. See
 //! [`recoverable`].
 //!
 //! # What this crate is for
@@ -84,7 +84,7 @@ pub use protocol::{
 pub use recoverable::{note_id_of, note_lookup_of};
 pub use secrets::{generate_note_secret, hash_k1, is_preimage};
 pub use signature::{
-    address_proof_digest, note_signature_digest, note_signature_digest_for_hash,
+    address_proof_message, note_signature_digest, note_signature_digest_for_hash,
     note_signature_message, note_signature_message_for_hash, sign_address_proof,
     verify_note_signature, verify_note_signature_hash,
 };
