@@ -826,9 +826,9 @@ pub fn mint_invoice_request_with_hash(
 /// The secret comes back on [`Request::new_secrets`]. **Persist it before
 /// paying the invoice this returns.** Paying for a note and then losing its
 /// secret is the one way the comment-bound scheme is worse than the preimage
-/// one it replaced, and persisting first removes it entirely. Drawing the
-/// secret from the seed derivation rather than the CSPRNG makes the note
-/// recoverable from birth, without any rotate at all.
+/// one it replaced, and persisting first removes it entirely. A Part 1 secret
+/// is plain randomness, never derived from the seed; for a note recoverable
+/// from the seed, mint to a Part 2 `cp1` with [`mint_invoice_request_with_hash`].
 pub fn mint_invoice_request(
     pay_callback: &str,
     amount_msat: u64,

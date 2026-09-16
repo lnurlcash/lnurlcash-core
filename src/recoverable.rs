@@ -331,9 +331,9 @@ fn note_ownership_digest() -> [u8; 32] {
     Sha256::digest(NOTE_OWNERSHIP_MESSAGE).into()
 }
 
-/// The raw message every ownership signature was made over before the
-/// 2026-09-16 32-byte digest change. Kept only for reading a `ck1` that
-/// verifies under that scheme, not for signing.
+/// The ownership message, `LNURLcash`. A current proof signs its sha256
+/// digest; a proof made before the 2026-09-16 digest change signed these raw
+/// bytes, and [`recover_note_ownership_pubkey`] still reads one.
 pub fn note_ownership_message() -> &'static [u8] {
     NOTE_OWNERSHIP_MESSAGE
 }

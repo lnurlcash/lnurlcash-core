@@ -188,16 +188,15 @@ pub fn cash_domain_indices(root: &CashNode, host: &str) -> Result<[u32; 4]> {
 
 /// `m/139'/d1/d2/d3/d4` for one mint: everything above a note's own index.
 ///
-/// Worth having as its own step, and not only to derive it once for a run of
-/// secrets. Every unhardened level in the path is at or above this node, so a
-/// signer given THIS rather than the seed needs no elliptic curve at all -
-/// each `i'` beneath it is HMAC-SHA512 plus one modular addition. That is the
-/// difference between a hardware wallet that can do LUD-25 recovery and one
-/// that would need secp256k1 added to its firmware for it.
+/// Its own step because it is the unit a signer is provisioned with, and the
+/// node Part 2's address branch is (see
+/// [`crate::recoverable::derive_cash_address_node`]). It does not spare a
+/// signer the curve: the per-note tweak beneath it, and the `ck1` signature,
+/// both need secp256k1.
 ///
-/// The cost is that whoever derives it can derive every note secret the wallet
-/// will ever hold AT THIS MINT, so it is provisioning material rather than
-/// something to hand out: one mint's subtree, not the wallet.
+/// Whoever derives it can derive every note key the wallet will ever hold AT
+/// THIS MINT, so it is provisioning material rather than something to hand
+/// out: one mint's subtree, not the wallet.
 ///
 /// `host` is the mint host exactly as the wallet stores it - lowercase, port
 /// included where there is one - which is what the reference wallet passes, so

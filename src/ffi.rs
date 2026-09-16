@@ -370,11 +370,9 @@ pub fn derive_cash_root(seed_hex: &str) -> FfiResult<String> {
 
 /// `m/139'/d1/d2/d3/d4` for one mint, as a 64-byte hex node.
 ///
-/// Every unhardened level in LUD-25's path is at or above this node, so a
-/// hardware signer given THIS rather than the seed needs no elliptic curve:
-/// each index beneath it is one hardened step. Whoever derives it can derive
-/// every note secret held at that mint, so it is provisioning material - one
-/// mint's subtree, not the wallet.
+/// The same node [`derive_cash_address_node`] returns: Part 2's note keys hang
+/// off it. Whoever derives it can derive every note key held at that mint, so
+/// it is provisioning material - one mint's subtree, not the wallet.
 #[uniffi::export]
 pub fn derive_cash_domain_node(root_hex: &str, host: &str) -> FfiResult<String> {
     let root = cash::cash_node_from_hex(root_hex)?;
