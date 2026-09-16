@@ -39,8 +39,18 @@ pub fn address_proof_message(action: &str, username: &str) -> crate::Result<Stri
     Ok(format!("{DOMAIN_TAG}:{action}:{username}"))
 }
 
+/// [`address_proof_message`], hashed to a 32-byte digest before signing.
+/// `username` is variable-length, so the raw message would otherwise only
+/// rarely land on the 32 bytes most Schnorr signers require - the same
+/// reason ownership proofs are hashed (see [`crate::recoverable`]).
+pub fn address_proof_digest(action: &str, username: &str) -> crate::Result<[u8; 32]> {
+    Ok(Sha256::digest(address_proof_message(action, username)?.as_bytes()).into())
+}
+
 /// Sign a register/update or unregister proof as a raw 64-byte BIP-340
-/// signature over the UTF-8 protocol message.
+/// signature over `sha256` of the protocol message. This is a fresh action a
+/// WALLET initiates itself, never a stored bearer secret read back later, so
+/// there is no old scheme to fall back to reading, unlike ownership proofs.
 pub fn sign_address_proof(
     index_zero_secret_key: &[u8; 32],
     action: &str,
@@ -49,17 +59,15 @@ pub fn sign_address_proof(
     let key = SigningKey::from_bytes(index_zero_secret_key).map_err(|_| {
         crate::Error::Protocol("an index-zero secret key is a 32-byte scalar in [1, n)".into())
     })?;
-    key.sign_raw(
-        address_proof_message(action, username)?.as_bytes(),
-        &[0u8; 32],
-    )
-    .map(|signature| signature.to_bytes())
-    .map_err(|_| crate::Error::Protocol("could not sign the address proof message".into()))
+    key.sign_raw(&address_proof_digest(action, username)?, &[0u8; 32])
+        .map(|signature| signature.to_bytes())
+        .map_err(|_| crate::Error::Protocol("could not sign the address proof message".into()))
 }
 
 /// What a Lightning node's signmessage puts its pen to, and so what every
 /// recoverable-ECDSA SERVICE signature is made over. WALLET Schnorr proofs
-/// deliberately sign their raw UTF-8 messages instead.
+/// deliberately hash their own UTF-8 messages to a 32-byte digest instead
+/// (see [`address_proof_digest`] and [`crate::recoverable::sign_note_ownership`]).
 pub(crate) fn lightning_signed_digest(message: &str) -> [u8; 32] {
     let inner = Sha256::digest([LIGHTNING_SIGNED_MESSAGE_PREFIX, message.as_bytes()].concat());
     Sha256::digest(inner).into()

@@ -84,9 +84,9 @@ pub use protocol::{
 pub use recoverable::{note_id_of, note_lookup_of};
 pub use secrets::{generate_note_secret, hash_k1, is_preimage};
 pub use signature::{
-    address_proof_message, note_signature_digest, note_signature_digest_for_hash,
-    note_signature_message, note_signature_message_for_hash, sign_address_proof,
-    verify_note_signature, verify_note_signature_hash,
+    address_proof_digest, address_proof_message, note_signature_digest,
+    note_signature_digest_for_hash, note_signature_message, note_signature_message_for_hash,
+    sign_address_proof, verify_note_signature, verify_note_signature_hash,
 };
 pub use urls::{
     from_bech32_lnurl, from_lud17, is_allowed_service_url, is_bech32_lnurl, is_lightning_address,
