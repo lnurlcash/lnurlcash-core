@@ -46,15 +46,15 @@ cash::derive_cash_domain_node(root, host)       m/139'/d1/d2/d3/d4, d1..d4 =
   RAW: BIP-32 reads >= 2^31 as hardened, so ~half the levels are, decided by
   the host name. NEVER mask the top bit, NEVER harden all four - either
   derives a different tree and restores nothing, silently.
-cash::derive_cash_secret(root, host, i) / cash::cash_secret_at(node, i)
-  below the domain node there is no unhardened level, so a signer given the
-  node needs no curve - that is why the node is its own step
+  Part 1 secrets are NOT derived from the seed (Part 1 is plain randomness).
+  Part 2 note keys hang off this node: see derive_cash_address_node below.
+  Bearer material for every note key at that mint.
+cash::cash_domain_indices(root, host) -> [u32; 4]   the raw d1..d4
 cash::cash_node_to_hex / from_hex     privateKey || chainCode, 64 bytes
 cash::derive_cash_child(node, raw_u32)          BIP-32 CKDpriv, for checking
   this crate against BIP-32's own vectors
 cash::derive_cash_master(seed) -> CashNode      the BIP-32 master, for walking
   a path this crate does not name
-cash::CashSecretSource::{new, next_secret, next_index}
 secrets::derive_note_root / derive_note_secret  LEGACY pre-spec HMAC scheme.
   Do not mint under it; still scanned so old notes stay findable.
 note::build_note_info_url_by_hash(withdraw_link, h) -> Option<String>
@@ -74,18 +74,21 @@ encode_cx1/decode_cx1/is_cx1   watch-only branch Cx1 { pubkey_x_only,
   chain_code }, "cx". Decoders return None, never panic. No length limit;
   all-uppercase accepted; mixed case, a bech32 (not bech32m) checksum, the
   wrong hrp or length and non-zero padding refused (BIP-350)
-derive_cash_address_node(root, host) -> CashNode   m/139'/1'/d1..d4, hashing
-  key m/139'/1'/0. The REFERENCE WALLET's path, not the spec text's
-  m/139'/d1..d4 (that is the Part 1 ladder's node, and finds none of its notes)
+derive_cash_address_node(root, host) -> CashNode   the domain node itself:
+  m/139'/d1/d2/d3/d4, hashing key m/139'/0, the spec text's literal path. No
+  m/139'/1' hop (that was dropped with the old Part 1 secret ladder)
 cash_node_to_cx1(node) -> Cx1
 derive_note_pubkey(P, chain_code, i) -> pk     watch-only, BIP-341 style
   tweak; i any u32, 4-byte big-endian, never hardened. t >= n is an error,
   never reduced: use the next index
 derive_note_secret_key(p, chain_code, i) -> sk   negates p first when P has
   odd y
-sign_note_ownership(sk) -> [u8; 96]   pk||BIP-340 sig over raw UTF-8
-  "LNURLcash", zero auxiliary input so seed recovery reproduces the ck1
-recover_note_ownership_pubkey(payload) -> Option<pk>   verifies before returning
+sign_note_ownership(sk) -> [u8; 96]   pk||BIP-340 sig over sha256("LNURLcash")
+  (the 32-byte digest, not the raw string), zero auxiliary input so seed
+  recovery reproduces the ck1
+recover_note_ownership_pubkey(payload) -> Option<pk>   verifies before returning.
+  Also reads a 96-byte proof over the raw "LNURLcash" bytes and the 65-byte
+  legacy ECDSA shape, so notes minted under either can still be rotated
 note_id_of(k1) -> Option<id>   sha256(k1) for a secret, the verified embedded key for
   a ck1
 note_lookup_of(k1) -> Option<String>   the hash, or the cp1 for a ck1
@@ -102,9 +105,11 @@ derive_nostr_cash_seed(sk) / derive_nostr_address_node(sk, host)   NOT
 resolve_note_input / resolve_mint_input / resolve_lnurl_input
 parse_mint_fee / apply_mint_fee / gross_up_for_mint_fee
 build_note_url / with_new_k1 / without_k1
-address_proof_message(action, username) / sign_address_proof(index_zero_sk, action, username)
-  exact message: LNURLcash:<register|unregister>:<normalised username>
-  wire signature: raw 64-byte BIP-340; key is address branch index 0
+address_proof_message(action, username) / address_proof_digest(action, username)
+sign_address_proof(index_zero_sk, action, username)
+  message: LNURLcash:<register|unregister>:<normalised username>
+  wire signature: raw 64-byte BIP-340 over sha256(message), no raw-message
+  fallback; key is address branch index 0
 decode_bolt11_amount_msat / is_bolt11_invoice / same_invoice
 
 client::Client::{fetch_note_info, rotate_note, split_note, merge_notes,

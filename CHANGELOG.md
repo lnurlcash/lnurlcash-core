@@ -5,6 +5,8 @@ carry breaking changes; pin an exact version.
 
 ## Unreleased
 
+Docs: README, llms.txt and doc comments now describe the literal `m/139'/d1/d2/d3/d4` address branch, the sha256-digest ownership and address proofs, and no Part 1 secret ladder.
+
 ### Ownership and address proofs sign a sha256 digest, not the raw message
 
 BIP-340's own reference implementation, and most conforming Schnorr signers

@@ -160,32 +160,37 @@ about 2.1e21. It is computed split. A naive version passes every small test.
 99.9999% fee — roughly a million steps — so any guard on it returns a
 non-minimal answer, and the *service* picks the fee.
 
-## Seed-recoverable note secrets
+## Seed-recoverable notes
 
-LUD-25 specifies them, and this crate implements the specified scheme:
+LUD-25 specifies one seed derivation, and this crate implements it:
 
 ```
 cashHashingKey   = m/139'/0
 (d1, d2, d3, d4) = HMAC-SHA256(cashHashingKey, host)[0..16] as 4 uint32
-k1_i             = m/139'/d1/d2/d3/d4/i'
+domainNode       = m/139'/d1/d2/d3/d4
 ```
 
 `d1..d4` are used **exactly as they fall**. BIP-32 reads any index `>= 2^31`
 as hardened, so which of the four levels are hardened is decided by the mint's
 own host name. Masking the top bit, or hardening all four, derives a different
-tree and restores nothing, silently. Only `i` is always hardened.
+tree and restores nothing, silently.
 
-`derive_cash_domain_node` is its own step for a reason: every unhardened level
-sits at or above it, so a hardware signer provisioned with that node rather
-than the seed needs **no elliptic curve at all**. The cost is that whoever
-derives it can derive every note secret held at that mint — provisioning
-material, one mint's subtree, not the wallet.
+Part 1 secrets are not derived from the seed. Part 1 has the wallet draw plain
+randomness, so a Part 1 note is only as recoverable as the wallet's backup of
+its secrets. Seed recovery is what Part 2 is for: its note keys hang off this
+same domain node (see below).
+
+`derive_cash_domain_node` is its own step because it is the unit a signer is
+provisioned with. Whoever holds it can derive every note key held at that
+mint — provisioning material, one mint's subtree, not the wallet. It does not
+spare the signer a curve: Part 2's per-note tweak and its `ck1` signature both
+need secp256k1.
 
 `secrets::derive_note_root` / `derive_note_secret` are the pre-spec HMAC
 scheme this project shipped before the draft had one. Not deprecated, because
 notes minted under it are still money; just not what to mint under.
 
-**The counter is half the backup.** A SERVICE must answer a hash lookup for a
+**The counter is half the backup.** A SERVICE must answer a lookup for a
 burned note exactly as it answers one for a note it never issued, and a rotate
 burns the index below, so a wallet that has rotated more than its gap limit
 cannot find its own position by scanning. The per-host counter is not secret —
@@ -197,8 +202,9 @@ upwards only.
 A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`, and the
 mint only ever sees `pk`, written `cp1...`. To spend the note you hand over
 `ck1...`, the 32-byte `pk` followed by a BIP-340 Schnorr signature by `sk`
-over the raw UTF-8 message `LNURLcash`. The mint verifies the pair and uses
-`pk` to find the note. The mint's certificate,
+over `sha256("LNURLcash")`. The digest is signed rather than the raw 9 bytes
+because most Schnorr signers only accept a 32-byte message. The mint verifies
+the pair and uses `pk` to find the note. The mint's certificate,
 `cs1...`, carries the amount in its human-readable part and the mint's
 signature over that amount and `hex(pk)`. So a recipient can check a note
 offline with nothing but its `ck1` and `cs1`.
@@ -230,8 +236,10 @@ created before the amount-bearing form. New issuance uses the explicit
 Registering, updating or unregistering a reference-mint Lightning Address
 uses the branch's index-0 private key. `sign_address_proof(&sk0, action,
 username)` returns the raw 64-byte BIP-340 proof over
-`LNURLcash:<action>:<username>`; action is `register` or `unregister`, and the
-username must be normalised exactly as it is sent to the service.
+`sha256("LNURLcash:<action>:<username>")` (`address_proof_message` builds the
+string, `address_proof_digest` the 32 bytes that are signed); action is
+`register` or `unregister`, and the username must be normalised exactly as it
+is sent to the service.
 
 The wire takes both kinds. A `ck1` goes anywhere a k1 does. A `cp1` goes
 anywhere an output does: `mint_invoice_request_with_hash` sends it as the
@@ -240,16 +248,18 @@ hash keeps `h`/`h2`, and `build_note_info_url_by_hash` sends it as `p` where a
 hash keeps `h`. `note_id_of(k1)` is the id a mint files either kind under, and
 `note_lookup_of(k1)` what to look a note up by without disclosing it. A `ck1`
 is deterministic from its note key so seed recovery reproduces it byte for byte.
-The decoder and lookup helpers also accept the old 65-byte recoverable-ECDSA
-shape so existing notes remain spendable; rotate those notes into a current
-96-byte Schnorr `ck1` rather than issuing new legacy values.
+The decoder and lookup helpers also read two older shapes so existing notes
+remain spendable: a 96-byte `ck1` signed over the raw message rather than its
+digest, and the 65-byte recoverable-ECDSA `ck1` from before that. Rotate those
+notes into a current `ck1` rather than issuing new legacy values.
 
 Three things worth knowing:
 
-- **The branch path follows the reference wallet, not the draft's text.** It
-  is `m/139'/1'/d1/d2/d3/d4`, with the hashing key at `m/139'/1'/0`. The text
-  says `m/139'/d1..d4`, which is the Part 1 ladder's own node, and a wallet
-  following it finds none of lnurl-wallet's notes.
+- **The branch is the domain node itself**, the draft's literal
+  `m/139'/d1/d2/d3/d4`, with the hashing key at `m/139'/0`. Earlier versions
+  inserted a `1'` hop (`m/139'/1'/...`) to keep clear of a deterministic Part 1
+  secret ladder that has since been dropped; keys derived under that hop are
+  not on this branch.
 - **A `cx1` links every note on its branch.** It spends nothing, but whoever
   holds it can list every key on the branch and ask the mint about each one.
 - **`i` is any u32**, serialised as 4 bytes big-endian, never hardened. A tweak
