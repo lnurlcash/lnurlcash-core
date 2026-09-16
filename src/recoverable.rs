@@ -311,16 +311,29 @@ pub fn derive_note_secret_key(
 
 // ---- ownership proofs ----
 //
-//   sig = BIP340.Sign(sk, "LNURLcash")
+//   sig = BIP340.Sign(sk, sha256("LNURLcash"))
 //   ck1 = bech32m("ck", pk || sig)
 //
-// One fixed message and fixed all-zero BIP-340 auxiliary input make the bearer
-// value deterministic: re-deriving a key reproduces its one `ck1` byte for byte.
+// One fixed digest and fixed all-zero BIP-340 auxiliary input make the
+// bearer value deterministic: re-deriving a key reproduces its one `ck1`
+// byte for byte. The message is hashed to 32 bytes before signing (rather
+// than signed as the raw 9-byte ASCII string) because BIP-340's own
+// reference implementation, and most conforming Schnorr signers
+// (`libsecp256k1`'s `schnorrsig` module included), only accept a 32-byte
+// message - `k256::schnorr`'s `sign_raw` is permissive enough not to need
+// this, but signing the raw string would not interoperate with an
+// off-the-shelf signer (2026-09-16, luds#6de59b2).
 
 const NOTE_OWNERSHIP_MESSAGE: &[u8] = b"LNURLcash";
 const LEGACY_NOTE_OWNERSHIP_MESSAGE: &str = "LNURLcash";
 
-/// The raw message every ownership signature is made over.
+fn note_ownership_digest() -> [u8; 32] {
+    Sha256::digest(NOTE_OWNERSHIP_MESSAGE).into()
+}
+
+/// The raw message every ownership signature was made over before the
+/// 2026-09-16 32-byte digest change. Kept only for reading a `ck1` that
+/// verifies under that scheme, not for signing.
 pub fn note_ownership_message() -> &'static [u8] {
     NOTE_OWNERSHIP_MESSAGE
 }
@@ -331,7 +344,7 @@ pub fn sign_note_ownership(secret_key: &[u8; 32]) -> Result<[u8; 96]> {
     let key = SigningKey::from_bytes(secret_key)
         .map_err(|_| Error::Protocol("a note secret key is a 32-byte scalar in [1, n)".into()))?;
     let signature = key
-        .sign_raw(NOTE_OWNERSHIP_MESSAGE, &[0u8; 32])
+        .sign_raw(&note_ownership_digest(), &[0u8; 32])
         .map_err(|_| Error::Protocol("could not sign the note ownership message".into()))?;
     let mut out = [0u8; 96];
     out[..32].copy_from_slice(&key.verifying_key().to_bytes());
@@ -341,12 +354,21 @@ pub fn sign_note_ownership(secret_key: &[u8; 32]) -> Result<[u8; 96]> {
 
 /// Validate a `pk || sig` ownership payload and return its embedded x-only
 /// public key. `None` for an invalid proof or wrong length.
+///
+/// Tries the current sha256-digest scheme first, then falls back to the pre-
+/// 2026-09-16 raw-message scheme so a note minted under it stays redeemable
+/// until it is rotated - never signed under that scheme by [`sign_note_ownership`]
+/// anymore, only read back here.
 pub fn recover_note_ownership_pubkey(payload: &[u8]) -> Option<[u8; 32]> {
     if payload.len() == 96 {
         let key = VerifyingKey::from_bytes(&payload[..32]).ok()?;
         let signature = SchnorrSignature::try_from(&payload[32..]).ok()?;
-        key.verify_raw(NOTE_OWNERSHIP_MESSAGE, &signature).ok()?;
-        return payload[..32].try_into().ok();
+        if key.verify_raw(&note_ownership_digest(), &signature).is_ok()
+            || key.verify_raw(NOTE_OWNERSHIP_MESSAGE, &signature).is_ok()
+        {
+            return payload[..32].try_into().ok();
+        }
+        return None;
     }
     if payload.len() != 65 {
         return None;
@@ -618,6 +640,23 @@ mod tests {
                 secret.x_only_public_key(&Secp256k1::new()).0.serialize()
             ))
         );
+    }
+
+    #[test]
+    fn a_raw_message_ck1_stays_readable_for_rotation() {
+        // Pre-2026-09-16: signed over the raw 9-byte "LNURLcash" string
+        // rather than its sha256 digest - sign_note_ownership never produces
+        // this anymore, but a note minted under it must stay redeemable.
+        let key = SigningKey::from_bytes(&[0x22; 32]).expect("a valid key");
+        let signature = key
+            .sign_raw(NOTE_OWNERSHIP_MESSAGE, &[0u8; 32])
+            .expect("signs");
+        let mut payload = [0u8; 96];
+        payload[..32].copy_from_slice(&key.verifying_key().to_bytes());
+        payload[32..].copy_from_slice(signature.to_bytes().as_ref());
+
+        let expected: [u8; 32] = key.verifying_key().to_bytes().into();
+        assert_eq!(recover_note_ownership_pubkey(&payload), Some(expected));
     }
 
     #[test]

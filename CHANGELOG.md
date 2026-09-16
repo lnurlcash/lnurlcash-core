@@ -5,6 +5,29 @@ carry breaking changes; pin an exact version.
 
 ## Unreleased
 
+### Ownership and address proofs sign a sha256 digest, not the raw message
+
+BIP-340's own reference implementation, and most conforming Schnorr signers
+(`libsecp256k1`'s `schnorrsig` module included), only accept a 32-byte
+message. `k256::schnorr`'s `sign_raw` is permissive enough not to need this,
+so signing the raw 9-byte `LNURLcash` string (and the variable-length
+address-proof string) worked here without ever having interoperated with an
+off-the-shelf signer. Matches `lnurl-wallet#167`/`#168` and `luds#6de59b2`.
+
+- `sign_note_ownership` now signs `sha256("LNURLcash")` instead of the raw
+  string. `recover_note_ownership_pubkey` verifies against that digest first,
+  then falls back to the pre-2026-09-16 raw-message scheme so a note minted
+  under it stays redeemable until it is rotated - `sign_note_ownership` never
+  produces that shape anymore, only [`recover_note_ownership_pubkey`] reads
+  it back.
+- `sign_address_proof` now signs `sha256(message)` via the new
+  `address_proof_digest`, for the same reason: `username` is variable-length,
+  so the raw message would otherwise only rarely land on 32 bytes. No
+  fallback here - a register/unregister proof is a fresh action a wallet
+  initiates itself, never a stored bearer secret read back later.
+- Grade against `lnurlcash-conformance` 0.13.0's regenerated Part 2, Nostr-
+  seed and spec vectors.
+
 ### BIP-340 wallet ownership proofs
 
 - Follow the revised LUD-25 `ck1` format: a 96-byte payload containing the
