@@ -1255,3 +1255,161 @@ fn nostr_seed_vectors() {
         }
     }
 }
+
+/// LUD-25's own published "Test Vectors" section (25.md), transcribed as
+/// spec-vectors.json - every value here is what the spec document itself
+/// publishes, not just this project's own internally-generated fixtures.
+#[test]
+fn spec_vectors() {
+    let vectors = load("spec-vectors.json");
+
+    let branch_of = |case: &Value| -> lnurlcash_core::cash::CashNode {
+        let seed = hex::decode(str_of(case, "seedHex")).expect("seedHex is hex");
+        let root = derive_cash_root(&seed).expect("root");
+        let host = str_of(case, "domain");
+
+        let hashing = derive_cash_child(&root, 0).expect("hashing key");
+        assert_eq!(
+            hex::encode(hashing.private_key),
+            str_of(case, "cashHashingKey")
+        );
+
+        let indices: Vec<u32> = case["domainIndices"]
+            .as_array()
+            .expect("domainIndices")
+            .iter()
+            .map(|v| v.as_u64().expect("index") as u32)
+            .collect();
+        assert_eq!(
+            cash_domain_indices(&root, &host).expect("indices").to_vec(),
+            indices
+        );
+
+        let branch = derive_cash_domain_node(&root, &host).expect("branch");
+        assert_eq!(
+            hex::encode(branch.private_key),
+            str_of(case, "branchPrivateKey")
+        );
+        assert_eq!(hex::encode(branch.chain_code), str_of(case, "chainCode"));
+
+        let cx1 = cash_node_to_cx1(&branch).expect("cx1");
+        assert_eq!(
+            hex::encode(cx1.pubkey_x_only),
+            str_of(case, "branchPubkeyXOnly")
+        );
+        assert_eq!(
+            encode_cx1(&cx1.pubkey_x_only, &cx1.chain_code),
+            str_of(case, "cx1")
+        );
+        branch
+    };
+
+    for vector_name in ["vector1", "vector2"] {
+        let case = &vectors[vector_name];
+        let branch = branch_of(case);
+        let cx1 = cash_node_to_cx1(&branch).expect("cx1");
+
+        for note in case["notes"].as_array().expect("notes") {
+            let index = note["index"].as_u64().expect("index") as u32;
+            let at = format!("{vector_name} #{index}");
+
+            let pk = derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, index)
+                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            assert_eq!(hex::encode(pk), str_of(note, "pk"), "{at}");
+            assert_eq!(encode_cp1(&pk), str_of(note, "cp1"), "{at}");
+
+            let sk = derive_note_secret_key(&branch.private_key, &branch.chain_code, index)
+                .unwrap_or_else(|err| panic!("{at}: {err}"));
+            assert_eq!(hex::encode(sk), str_of(note, "sk"), "{at}");
+
+            // x(sk_i . G) == pk_i, the round-trip 25.md calls out explicitly
+            let secp = Secp256k1::signing_only();
+            let (xonly, _) = SecretKey::from_slice(&sk)
+                .expect("valid scalar")
+                .x_only_public_key(&secp);
+            assert_eq!(
+                hex::encode(xonly.serialize()),
+                str_of(note, "pk"),
+                "{at}: sk_i.G round-trip"
+            );
+        }
+    }
+
+    // vector 2's LN address registration proofs, signed by sk_0
+    let v2 = &vectors["vector2"];
+    let branch2 = branch_of(v2);
+    let sk0 = derive_note_secret_key(&branch2.private_key, &branch2.chain_code, 0).expect("sk_0");
+    for proof in v2["addressProofs"].as_array().expect("addressProofs") {
+        let action = str_of(proof, "action");
+        let username = str_of(proof, "username");
+        assert_eq!(
+            address_proof_message(&action, &username).expect("message"),
+            str_of(proof, "message")
+        );
+        let signature = sign_address_proof(&sk0, &action, &username).expect("signs");
+        assert_eq!(
+            hex::encode(signature),
+            str_of(proof, "signature"),
+            "{action}"
+        );
+    }
+
+    // vector 3: ck1 wallet-side ownership proof, over sk_0/pk_0 from vector 1
+    let v3 = &vectors["vector3"];
+    let sk3: [u8; 32] = hex::decode(str_of(v3, "secretKey"))
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let ownership = sign_note_ownership(&sk3).expect("signs");
+    assert_eq!(
+        hex::encode(&ownership[32..]),
+        str_of(v3, "ownershipSignature")
+    );
+    assert_eq!(encode_ck1(&ownership), str_of(v3, "ck1"));
+
+    // vector 4: cs1 mint offline certificate, over pk_0/pk_1 from vector 1
+    let v4 = &vectors["vector4"];
+    let mint_key = SecretKey::from_slice(&hex::decode(str_of(v4, "mintPrivateKey")).expect("hex"))
+        .expect("valid mint key");
+    let secp = Secp256k1::new();
+    let mint_pubkey = hex::encode(PublicKey::from_secret_key(&secp, &mint_key).serialize());
+    assert_eq!(mint_pubkey, str_of(v4, "mintPubkey"));
+
+    let pk = str_of(v4, "notePubkey");
+    let other_pk = str_of(v4, "otherNotePubkey");
+    for cert in v4["certificates"].as_array().expect("certificates") {
+        let amount = cert["amountMsat"].as_u64().expect("amountMsat");
+        let at = format!("{amount} msat");
+
+        assert_eq!(
+            note_signature_message_for_hash(&pk, amount),
+            str_of(cert, "message"),
+            "{at}"
+        );
+        let digest = note_signature_digest_for_hash(&pk, amount);
+        assert_eq!(hex::encode(digest), str_of(cert, "digest"), "{at}");
+
+        let (recovery, compact) = secp
+            .sign_ecdsa_recoverable(&Message::from_digest(digest), &mint_key)
+            .serialize_compact();
+        let mut signature = [0u8; 65];
+        signature[..64].copy_from_slice(&compact);
+        signature[64] = recovery.to_i32() as u8;
+        let signature_hex = hex::encode(signature);
+        assert_eq!(signature_hex, str_of(cert, "signature"), "{at}");
+        assert_eq!(
+            encode_cs1_with_amount(amount, &signature),
+            str_of(cert, "cs1"),
+            "{at}"
+        );
+
+        assert!(
+            verify_note_signature_hash(&pk, amount, &signature_hex, &mint_pubkey),
+            "{at}"
+        );
+        assert!(
+            !verify_note_signature_hash(&other_pk, amount, &signature_hex, &mint_pubkey),
+            "{at}: another note"
+        );
+    }
+}
