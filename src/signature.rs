@@ -15,13 +15,14 @@
 //! ```
 //!
 //! The note id is `hex(sha256(k1))` for a Part 1 note, and for a Part 2 note
-//! the hex public key its `ck1` recovers to (see [`crate::recoverable`]).
+//! the verified hex public key embedded in its `ck1` (see [`crate::recoverable`]).
 //! Either way the signature commits to the note's ID, not its secret, so a
 //! holder can prove issuance - to expose a mint that will not honour its own
 //! note - without revealing what would let anyone spend it.
 
+use k256::schnorr::SigningKey;
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-use secp256k1::{Message, Secp256k1, SecretKey};
+use secp256k1::{Message, Secp256k1};
 use sha2::{Digest, Sha256};
 
 use crate::recoverable::{decode_any_cs1, note_id_of};
@@ -29,7 +30,7 @@ use crate::recoverable::{decode_any_cs1, note_id_of};
 const LIGHTNING_SIGNED_MESSAGE_PREFIX: &[u8] = b"Lightning Signed Message:";
 const DOMAIN_TAG: &str = "LNURLcash";
 
-fn address_proof_message(action: &str, username: &str) -> crate::Result<String> {
+pub fn address_proof_message(action: &str, username: &str) -> crate::Result<String> {
     if action != "register" && action != "unregister" {
         return Err(crate::Error::Protocol(
             "an address proof action is register or unregister".into(),
@@ -38,44 +39,34 @@ fn address_proof_message(action: &str, username: &str) -> crate::Result<String> 
     Ok(format!("{DOMAIN_TAG}:{action}:{username}"))
 }
 
-/// The action- and username-bound digest used to prove control of a registered
-/// address's index-0 branch key. The caller must use the same normalised
-/// username it sends to the SERVICE.
-pub fn address_proof_digest(action: &str, username: &str) -> crate::Result<[u8; 32]> {
-    Ok(lightning_signed_digest(&address_proof_message(
-        action, username,
-    )?))
-}
-
-/// Sign a register/update or unregister proof as raw `r || s || recovery-id`.
+/// Sign a register/update or unregister proof as a raw 64-byte BIP-340
+/// signature over the UTF-8 protocol message.
 pub fn sign_address_proof(
     index_zero_secret_key: &[u8; 32],
     action: &str,
     username: &str,
-) -> crate::Result<[u8; 65]> {
-    let key = SecretKey::from_slice(index_zero_secret_key).map_err(|_| {
+) -> crate::Result<[u8; 64]> {
+    let key = SigningKey::from_bytes(index_zero_secret_key).map_err(|_| {
         crate::Error::Protocol("an index-zero secret key is a 32-byte scalar in [1, n)".into())
     })?;
-    let signature = Secp256k1::signing_only().sign_ecdsa_recoverable(
-        &Message::from_digest(address_proof_digest(action, username)?),
-        &key,
-    );
-    let (recovery, compact) = signature.serialize_compact();
-    let mut out = [0u8; 65];
-    out[..64].copy_from_slice(&compact);
-    out[64] = recovery.to_i32() as u8;
-    Ok(out)
+    key.sign_raw(
+        address_proof_message(action, username)?.as_bytes(),
+        &[0u8; 32],
+    )
+    .map(|signature| signature.to_bytes())
+    .map_err(|_| crate::Error::Protocol("could not sign the address proof message".into()))
 }
 
 /// What a Lightning node's signmessage puts its pen to, and so what every
-/// LNURLcash signature is made over, a Part 2 ownership proof included.
+/// recoverable-ECDSA SERVICE signature is made over. WALLET Schnorr proofs
+/// deliberately sign their raw UTF-8 messages instead.
 pub(crate) fn lightning_signed_digest(message: &str) -> [u8; 32] {
     let inner = Sha256::digest([LIGHTNING_SIGNED_MESSAGE_PREFIX, message.as_bytes()].concat());
     Sha256::digest(inner).into()
 }
 
 /// The message a SERVICE signs over a note. `None` for a k1 that is neither
-/// 32 bytes of hex nor a `ck1` that recovers, since neither has an id to sign.
+/// 32 bytes of hex nor a valid `ck1`, since neither has an id to sign.
 pub fn note_signature_message(k1: &str, amount_msat: u64) -> Option<String> {
     Some(note_signature_message_for_hash(
         &note_id_of(k1)?,
@@ -107,7 +98,7 @@ pub fn note_signature_digest_for_hash(h: &str, amount_msat: u64) -> [u8; 32] {
 /// Recover the signer's pubkey and check it against `mint_pubkey_hex`.
 ///
 /// `k1` is a Part 1 secret or a Part 2 `ck1`; a `ck1`'s id is the key it
-/// recovers to, found locally, so checking one needs no network either.
+/// embeds and proves, found locally, so checking one needs no network either.
 /// `signature_hex` is 65 bytes of hex, or either form of Part 2 `cs1`.
 /// Amount-bearing certificates can be decoded separately when the caller
 /// needs the amount carried on the wire.

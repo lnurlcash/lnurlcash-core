@@ -405,12 +405,9 @@ fn check_mint_pubkey(mint_pubkey: Option<&str>, policy: Policy) -> Result<()> {
     ))
 }
 
-/// Whether two k1s name one note. A Part 1 secret has one spelling, but a
-/// Part 2 note has more than one valid `ck1`: anyone can flip a signature to
-/// its high-S twin, and a signer drawing another nonce makes another. So a
-/// SERVICE that echoes a different `ck1` recovering to the same key has named
-/// the same note, while one recovering to any other key has not. A k1 with no
-/// note id at all still has to come back as the same string.
+/// Whether two k1s name one note. Exact spelling is preferred; valid `ck1`
+/// values may also be compared by their verified embedded note key. A k1 with
+/// no note id at all still has to come back as the same string.
 fn same_note(a: &str, b: &str) -> bool {
     if a.trim().eq_ignore_ascii_case(b.trim()) {
         return true;

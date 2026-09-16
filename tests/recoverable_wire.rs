@@ -13,13 +13,12 @@ use lnurlcash_core::protocol::{
     split_request_with_hash, MutationKind, Policy,
 };
 use lnurlcash_core::recoverable::{
-    decode_ck1, encode_ck1, encode_cp1, encode_cs1_with_amount, recover_note_ownership_pubkey,
+    encode_ck1, encode_cp1, encode_cs1_with_amount, recover_note_ownership_pubkey,
     sign_note_ownership,
 };
 use lnurlcash_core::{
     hash_k1, note_id_of, note_lookup_of, note_signature_message, resolve_note_input, Error,
 };
-use secp256k1::SecretKey;
 use serde_json::{json, Value};
 use url::Url;
 
@@ -35,13 +34,12 @@ struct Part2Note {
 
 fn part2_note(fill: u8) -> Part2Note {
     let signature = sign_note_ownership(&[fill; 32]).expect("a valid key");
-    let pubkey = recover_note_ownership_pubkey(&signature).expect("recovers");
+    let pubkey = recover_note_ownership_pubkey(&signature).expect("verifies");
     Part2Note {
         pubkey: hex::encode(pubkey),
         cp1: encode_cp1(&pubkey),
         ck1: encode_ck1(&signature),
-        // the same 65 bytes under the certificate's prefix
-        cs1_shaped: encode_cs1_with_amount(21_000, &signature),
+        cs1_shaped: encode_cs1_with_amount(21_000, &[0x33; 65]),
     }
 }
 
@@ -72,7 +70,7 @@ fn a_part1_secret_is_filed_and_looked_up_under_its_hash() {
 }
 
 #[test]
-fn a_part2_note_is_filed_under_the_key_its_ck1_recovers_to() {
+fn a_part2_note_is_filed_under_the_verified_key_in_its_ck1() {
     let a = part2_note(0x11);
     assert_eq!(note_id_of(&a.ck1), Some(a.pubkey.clone()));
     assert_eq!(note_id_of(&a.ck1.to_ascii_uppercase()), Some(a.pubkey));
@@ -172,24 +170,12 @@ fn part2_vectors() -> Value {
     serde_json::from_str(&text).expect("vector file is valid JSON")
 }
 
-/// The same signature with s replaced by n - s and the recovery id flipped.
-/// Anyone holding a `ck1` can make this, and it recovers to the same key.
-fn high_s_twin(signature: &[u8; 65]) -> [u8; 65] {
-    let s = SecretKey::from_slice(&signature[32..64]).expect("s is in [1, n)");
-    let mut twin = *signature;
-    twin[32..64].copy_from_slice(&s.negate().secret_bytes());
-    twin[64] ^= 1;
-    twin
-}
-
 #[test]
-fn an_echoed_ck1_is_the_same_note_when_it_recovers_to_the_same_key() {
+fn an_echoed_ck1_must_be_the_same_valid_bearer() {
     let vectors = part2_vectors();
     let notes = vectors["branches"][0]["notes"].as_array().expect("notes");
     let ours = notes[0]["ck1"].as_str().expect("ck1").to_string();
     let other = notes[1]["ck1"].as_str().expect("ck1").to_string();
-    let twin = encode_ck1(&high_s_twin(&decode_ck1(&ours).expect("a vector ck1")));
-    assert_ne!(twin, ours, "the twin is a different string");
 
     let url = format!("https://mint.example/w?k1={ours}&amount=21000");
     let answer = |echoed: &str| {
@@ -207,8 +193,8 @@ fn an_echoed_ck1_is_the_same_note_when_it_recovers_to_the_same_key() {
         )
     };
 
-    // the same note, however the SERVICE spells its ck1
-    for echoed in [ours.clone(), ours.to_ascii_uppercase(), twin.clone()] {
+    // Bech32 casing does not make a different bearer.
+    for echoed in [ours.clone(), ours.to_ascii_uppercase()] {
         let info = answer(&echoed).unwrap_or_else(|err| panic!("{echoed}: {err}"));
         assert_eq!(note_id_of(&info.k1), note_id_of(&ours), "{echoed}");
     }

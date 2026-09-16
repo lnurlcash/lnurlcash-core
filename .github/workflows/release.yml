@@ -58,7 +58,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: lnurlcash/lnurlcash-conformance
-          ref: v0.11.0
+          ref: v0.12.0
           # Keep the auxiliary checkout under Cargo's ignored build tree.
           # A sibling at the repository root is seen as uncommitted package
           # content and makes `cargo publish` refuse an otherwise clean tag.

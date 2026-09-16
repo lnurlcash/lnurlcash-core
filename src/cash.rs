@@ -1,12 +1,12 @@
-//! LUD-25 seed-recoverable note secrets: the specified scheme.
-//!
-//! LUD-25's "Seed-recoverable note secrets" section, in full:
+//! LUD-25's `m/139'` branch derivation: the BIP-32 walk from a wallet's cash
+//! root down to a per-`SERVICE` domain node, exactly as Part 2's "Seed &
+//! derivation" section specifies it:
 //!
 //! ```text
 //! cashHashingKey   = derive(masterKey, m/139'/0)
 //! domainMaterial   = hmacSha256(cashHashingKey, full SERVICE domain)
 //! (d1, d2, d3, d4) = first 16 bytes of domainMaterial as 4 uint32
-//! secret_i         = derive(masterKey, m/139'/d1/d2/d3/d4/i')
+//! domainNode       = derive(masterKey, m/139'/d1/d2/d3/d4)
 //! ```
 //!
 //! "exactly as LUD-05", says the draft of the middle two lines, and that
@@ -16,20 +16,23 @@
 //! are hardened by magnitude alone. They are used exactly as they fall:
 //! nothing is masked, and nothing is forced hardened. That is what LUD-05's
 //! own corpus does with the same four longs, and what the reference wallet
-//! does. Only `i` is deliberately hardened, by the spec's own `i'`.
+//! does.
 //!
 //! An implementation that masks the top bit, or hardens all four, derives a
 //! different tree from every conforming wallet - and a restore against it
 //! finds nothing, silently, and only once the money is gone.
 //!
-//! This is NOT the scheme in [`crate::secrets`]. That one (HMAC-SHA256 under
-//! `lnurlcash-note-v1`) predates this section and is now the legacy scheme:
-//! still derived, still scanned on restore forever, so nothing already minted
-//! goes missing, but no longer what a new wallet should mint under.
+//! Part 1 secrets are NOT derived from this node, or from the seed at all -
+//! Part 1's own text has `WALLET` generate plain randomness. An earlier
+//! reference-wallet extension did derive Part 1 secrets deterministically
+//! from a sibling of this branch, hardened at the note's own index; it has
+//! since been dropped as unspecified, and this module no longer provides it.
+//! [`crate::secrets`]' legacy scheme (HMAC-SHA256 under `lnurlcash-note-v1`,
+//! predating LUD-25 entirely) is still derived and still scanned on restore
+//! forever, so nothing already minted under either scheme goes missing.
 //!
-//! Part 2's address branch, `m/139'/1'/d1/d2/d3/d4`, is built from the same
-//! steps but hangs off its own node beside this ladder: see
-//! [`crate::recoverable`].
+//! Part 2's address branch is this exact domain node, for the same host: see
+//! [`crate::recoverable::derive_cash_address_node`].
 
 use hmac::{Hmac, Mac};
 use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
@@ -207,31 +210,6 @@ pub fn derive_cash_domain_node(root: &CashNode, host: &str) -> Result<CashNode> 
     Ok(node)
 }
 
-fn require_index(index: u32) -> Result<u32> {
-    if index >= HARDENED {
-        return Err(Error::Protocol(format!(
-            "a note index must be below 2^31, not {index}"
-        )));
-    }
-    Ok(index)
-}
-
-/// The i-th note secret beneath a mint's domain node, as 32 bytes of hex - the
-/// size of a payment preimage, so `hash_k1` and every wire path treat it
-/// exactly as they treat a randomly drawn one. The SERVICE sees no difference:
-/// it only ever receives sha256(k1).
-pub fn cash_secret_at(domain_node: &CashNode, index: u32) -> Result<String> {
-    let leaf = derive_cash_child(domain_node, require_index(index)? + HARDENED)?;
-    Ok(hex::encode(leaf.private_key))
-}
-
-/// The convenience form, from the root. Re-derives the domain node on every
-/// call, which is up to four point multiplications - fine for one secret,
-/// wasteful for a run of them. Hold the domain node for those.
-pub fn derive_cash_secret(root: &CashNode, host: &str, index: u32) -> Result<String> {
-    cash_secret_at(&derive_cash_domain_node(root, host)?, index)
-}
-
 /// privateKey || chainCode, 64 bytes of hex. Not a BIP-32 extended key: no
 /// version bytes, no depth, no parent fingerprint, no base58check. This is the
 /// same 64 bytes the reference wallet persists for its own root and the shape
@@ -264,57 +242,4 @@ pub fn cash_node_from_hex(value: &str) -> Result<CashNode> {
         private_key,
         chain_code,
     })
-}
-
-/// Walks a mint's indices in order, so a caller can let rotate, split and
-/// merge draw derived secrets without knowing anything about derivation.
-/// `next_index` reads back the next unused index afterwards - a split consumes
-/// two, a rotate one - which is the number the wallet persists as its counter
-/// for that host. The domain node is derived once, here, rather than per
-/// secret.
-///
-/// Persist that counter in the SAME write that stages the new records, and do
-/// it BEFORE the hash goes on the wire. A crash between the bump and the
-/// request wastes an index, which costs nothing; a crash the other way round
-/// re-derives a secret the mint has already seen, and the second note minted
-/// at it collides with the first.
-///
-/// The counter is not secret - an index reveals nothing without the root - so
-/// it belongs in an ordinary backup, and a restore should merge counters
-/// upwards only. It is also not optional: a gap scan cannot see a burned index
-/// (LUD-25 requires a hash lookup to answer for a spent note exactly as it
-/// answers for one that never existed), so a wallet that has rotated more
-/// times than its gap limit cannot rediscover its own position from the mint.
-pub struct CashSecretSource {
-    domain_node: CashNode,
-    next: u32,
-}
-
-impl std::fmt::Debug for CashSecretSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CashSecretSource")
-            .field("next", &self.next)
-            .finish_non_exhaustive()
-    }
-}
-
-impl CashSecretSource {
-    pub fn new(root: &CashNode, host: &str, start: u32) -> Result<Self> {
-        Ok(Self {
-            domain_node: derive_cash_domain_node(root, host)?,
-            next: require_index(start)?,
-        })
-    }
-
-    /// The next secret, advancing the counter.
-    pub fn next_secret(&mut self) -> Result<String> {
-        let secret = cash_secret_at(&self.domain_node, self.next)?;
-        self.next += 1;
-        Ok(secret)
-    }
-
-    /// The next unused index - what the wallet persists.
-    pub fn next_index(&self) -> u32 {
-        self.next
-    }
 }

@@ -38,7 +38,7 @@ pub fn note_signature(url: &str) -> Option<String> {
 }
 
 /// Input only qualifies as a note if it resolves to a URL carrying a
-/// well-formed k1: 32 bytes hex, or a Part 2 `ck1` that recovers to a key.
+/// well-formed k1: 32 bytes hex, or a Part 2 `ck1` with a valid key/signature pair.
 /// Anything else has no note id, and would fail the first offline signature
 /// check later, so it is refused at the door.
 pub fn resolve_note_input(value: &str) -> Option<String> {

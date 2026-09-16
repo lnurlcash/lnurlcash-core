@@ -383,21 +383,6 @@ pub fn derive_cash_domain_node(root_hex: &str, host: &str) -> FfiResult<String> 
     )?))
 }
 
-/// The i-th note secret beneath a mint's domain node.
-#[uniffi::export]
-pub fn cash_secret_at(domain_node_hex: &str, index: u32) -> FfiResult<String> {
-    let node = cash::cash_node_from_hex(domain_node_hex)?;
-    Ok(cash::cash_secret_at(&node, index)?)
-}
-
-/// The i-th note secret at a mint, from the root. Re-derives the domain node
-/// each call; hold the node for a run of secrets.
-#[uniffi::export]
-pub fn derive_cash_secret(root_hex: &str, host: &str, index: u32) -> FfiResult<String> {
-    let root = cash::cash_node_from_hex(root_hex)?;
-    Ok(cash::derive_cash_secret(&root, host, index)?)
-}
-
 /// The four raw uint32 levels a mint's subtree hangs off. Exposed for a wallet
 /// diagnosing a restore that finds nothing.
 #[uniffi::export]
@@ -514,18 +499,18 @@ pub fn is_cp1(value: &str) -> bool {
     recoverable::is_cp1(value)
 }
 
-/// A 65-byte ownership signature as a `ck1`: the string that spends the note.
+/// A 96-byte pubkey-plus-Schnorr-signature payload as a `ck1`.
 #[uniffi::export]
 pub fn encode_ck1(signature_hex: &str) -> FfiResult<String> {
     Ok(recoverable::encode_ck1(&hex_array(
         signature_hex,
-        "an ownership signature",
+        "an ownership payload",
     )?))
 }
 
 #[uniffi::export]
 pub fn decode_ck1(value: &str) -> Option<String> {
-    recoverable::decode_ck1(value).map(hex::encode)
+    recoverable::decode_ck1(value).map(|decoded| hex::encode(decoded.as_bytes()))
 }
 
 #[uniffi::export]
@@ -630,7 +615,7 @@ pub fn derive_note_secret_key(
     )?))
 }
 
-/// The raw 65-byte ownership signature, as hex. [`encode_ck1`] it for the
+/// The raw 96-byte pubkey-plus-Schnorr-signature payload, as hex. [`encode_ck1`] it for the
 /// wire; either way, it spends the note.
 #[uniffi::export]
 pub fn sign_note_ownership(secret_key_hex: &str) -> FfiResult<String> {
@@ -641,7 +626,7 @@ pub fn sign_note_ownership(secret_key_hex: &str) -> FfiResult<String> {
 }
 
 /// A register/update or unregister proof by the branch's index-0 key, as raw
-/// `r || s || recovery-id` hex.
+/// 64-byte BIP-340 Schnorr signature hex.
 #[uniffi::export]
 pub fn sign_address_proof(
     index_zero_secret_key_hex: &str,
@@ -662,7 +647,7 @@ pub fn recover_note_ownership_pubkey(signature_hex: &str) -> Option<String> {
 }
 
 /// The id a SERVICE files a note under: sha256(k1) for a secret, the
-/// recovered key for a `ck1`. Compare notes by this, never by k1.
+/// verified embedded key for a `ck1`. Compare notes by this, never by k1.
 #[uniffi::export]
 pub fn note_id_of(k1: &str) -> Option<String> {
     recoverable::note_id_of(k1)
@@ -675,8 +660,9 @@ pub fn note_lookup_of(k1: &str) -> Option<String> {
     recoverable::note_lookup_of(k1)
 }
 
-/// `m/139'/1'/d1/d2/d3/d4` for one mint, as a 64-byte hex node: the reference
-/// wallet's address branch. Bearer material - hand out its `cx1`.
+/// `m/139'/d1/d2/d3/d4` for one mint, as a 64-byte hex node: the domain node
+/// this section's Seed & derivation formula specifies. Bearer material - hand
+/// out its `cx1`.
 #[uniffi::export]
 pub fn derive_cash_address_node(root_hex: &str, host: &str) -> FfiResult<String> {
     let root = cash::cash_node_from_hex(root_hex)?;

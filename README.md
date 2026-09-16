@@ -196,8 +196,9 @@ upwards only.
 
 A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`, and the
 mint only ever sees `pk`, written `cp1...`. To spend the note you hand over
-`ck1...`, a recoverable signature by `sk` over the fixed message `LNURLcash`,
-and the mint recovers `pk` from it to find the note. The mint's certificate,
+`ck1...`, the 32-byte `pk` followed by a BIP-340 Schnorr signature by `sk`
+over the raw UTF-8 message `LNURLcash`. The mint verifies the pair and uses
+`pk` to find the note. The mint's certificate,
 `cs1...`, carries the amount in its human-readable part and the mint's
 signature over that amount and `hex(pk)`. So a recipient can check a note
 offline with nothing but its `ck1` and `cs1`.
@@ -228,7 +229,7 @@ created before the amount-bearing form. New issuance uses the explicit
 
 Registering, updating or unregistering a reference-mint Lightning Address
 uses the branch's index-0 private key. `sign_address_proof(&sk0, action,
-username)` returns the raw `r || s || recovery-id` proof over
+username)` returns the raw 64-byte BIP-340 proof over
 `LNURLcash:<action>:<username>`; action is `register` or `unregister`, and the
 username must be normalised exactly as it is sent to the service.
 
@@ -237,8 +238,11 @@ anywhere an output does: `mint_invoice_request_with_hash` sends it as the
 comment alone, the `*_request_with_hash` builders send it as `p1`/`p2` where a
 hash keeps `h`/`h2`, and `build_note_info_url_by_hash` sends it as `p` where a
 hash keeps `h`. `note_id_of(k1)` is the id a mint files either kind under, and
-`note_lookup_of(k1)` what to look a note up by without disclosing it. One note
-has more than one valid `ck1` string, so compare notes by id, never by k1.
+`note_lookup_of(k1)` what to look a note up by without disclosing it. A `ck1`
+is deterministic from its note key so seed recovery reproduces it byte for byte.
+The decoder and lookup helpers also accept the old 65-byte recoverable-ECDSA
+shape so existing notes remain spendable; rotate those notes into a current
+96-byte Schnorr `ck1` rather than issuing new legacy values.
 
 Three things worth knowing:
 
