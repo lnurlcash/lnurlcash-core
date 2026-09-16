@@ -383,21 +383,6 @@ pub fn derive_cash_domain_node(root_hex: &str, host: &str) -> FfiResult<String> 
     )?))
 }
 
-/// The i-th note secret beneath a mint's domain node.
-#[uniffi::export]
-pub fn cash_secret_at(domain_node_hex: &str, index: u32) -> FfiResult<String> {
-    let node = cash::cash_node_from_hex(domain_node_hex)?;
-    Ok(cash::cash_secret_at(&node, index)?)
-}
-
-/// The i-th note secret at a mint, from the root. Re-derives the domain node
-/// each call; hold the node for a run of secrets.
-#[uniffi::export]
-pub fn derive_cash_secret(root_hex: &str, host: &str, index: u32) -> FfiResult<String> {
-    let root = cash::cash_node_from_hex(root_hex)?;
-    Ok(cash::derive_cash_secret(&root, host, index)?)
-}
-
 /// The four raw uint32 levels a mint's subtree hangs off. Exposed for a wallet
 /// diagnosing a restore that finds nothing.
 #[uniffi::export]
@@ -675,8 +660,9 @@ pub fn note_lookup_of(k1: &str) -> Option<String> {
     recoverable::note_lookup_of(k1)
 }
 
-/// `m/139'/1'/d1/d2/d3/d4` for one mint, as a 64-byte hex node: the reference
-/// wallet's address branch. Bearer material - hand out its `cx1`.
+/// `m/139'/d1/d2/d3/d4` for one mint, as a 64-byte hex node: the domain node
+/// this section's Seed & derivation formula specifies. Bearer material - hand
+/// out its `cx1`.
 #[uniffi::export]
 pub fn derive_cash_address_node(root_hex: &str, host: &str) -> FfiResult<String> {
     let root = cash::cash_node_from_hex(root_hex)?;

@@ -10,8 +10,7 @@
 //! the `ck1` and the `cs1` (see [`crate::signature`]).
 //!
 //! The names and semantics follow the TypeScript kit, which follows
-//! lnurl-wallet's `src/lib`. Where the draft's text and that code disagree,
-//! this follows the code: see [`derive_cash_address_node`].
+//! lnurl-wallet's `src/lib`.
 
 use bech32::{FromBase32, ToBase32, Variant};
 use hmac::{Hmac, Mac};
@@ -20,7 +19,7 @@ use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::{Keypair, Message, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
-use crate::cash::{derive_cash_child, derive_cash_domain_node, derive_cash_root, CashNode};
+use crate::cash::{derive_cash_domain_node, derive_cash_root, CashNode};
 use crate::errors::{Error, Result};
 use crate::secrets::{hash_k1, is_preimage};
 use crate::signature::lightning_signed_digest;
@@ -400,23 +399,18 @@ pub fn note_lookup_of(k1: &str) -> Option<String> {
 
 // ---- the address branch ----
 
-/// `m/139'/1'`: the node the address branches of every mint hang off.
-const ADDRESS_PURPOSE: u32 = 1 + 0x8000_0000;
-
-/// `m/139'/1'/d1/d2/d3/d4` for one mint, with `d1..d4` the four raw
-/// big-endian uint32 of HMAC-SHA256(key = the private key at `m/139'/1'/0`,
-/// msg = host), used exactly as they fall, as in [`crate::cash`].
-///
-/// This is lnurl-wallet's path, and the one every implementation uses. The
-/// draft's text roots the branch at `m/139'/d1..d4` with the hashing key at
-/// `m/139'/0`, which is the very node [`derive_cash_domain_node`] already
-/// derives for Part 1 secrets, so a wallet following the text would find none
-/// of the reference wallet's notes.
+/// `m/139'/d1/d2/d3/d4` for one mint - the literal path this section's text
+/// specifies, and the exact node [`derive_cash_domain_node`] already derives
+/// for any `SERVICE`. There is no separate purpose for Part 2: an earlier
+/// reference-wallet extension deterministically derived Part 1 secrets off
+/// this same root too, under a `1'` sub-purpose kept just for this branch to
+/// avoid colliding with it; that extension is gone (see [`crate::cash`]), so
+/// there is nothing left to collide with.
 ///
 /// Bearer material for every note on the branch. Hand out
 /// [`cash_node_to_cx1`] of it, never the node.
 pub fn derive_cash_address_node(root: &CashNode, host: &str) -> Result<CashNode> {
-    derive_cash_domain_node(&derive_cash_child(root, ADDRESS_PURPOSE)?, host)
+    derive_cash_domain_node(root, host)
 }
 
 /// The watch-only half of a branch node.
@@ -636,11 +630,11 @@ mod tests {
     }
 
     #[test]
-    fn the_address_branch_never_shares_a_node_with_the_part1_ladder() {
+    fn the_address_branch_is_the_domain_node_itself() {
         let root = derive_cash_root(&SEED).expect("root");
         let address = derive_cash_address_node(&root, "mint.example").expect("address node");
         let domain = derive_cash_domain_node(&root, "mint.example").expect("domain node");
-        assert_ne!(cash_node_to_hex(&address), cash_node_to_hex(&domain));
+        assert_eq!(cash_node_to_hex(&address), cash_node_to_hex(&domain));
     }
 
     #[test]

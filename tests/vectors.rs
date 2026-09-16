@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use hmac::{Hmac, Mac};
 use lnurlcash_core::cash::{
-    cash_domain_indices, cash_node_from_hex, cash_node_to_hex, cash_secret_at, derive_cash_child,
-    derive_cash_domain_node, derive_cash_root, derive_cash_secret,
+    cash_domain_indices, cash_node_from_hex, cash_node_to_hex, derive_cash_child,
+    derive_cash_domain_node, derive_cash_root,
 };
 use lnurlcash_core::protocol::{
     melt_request, mint_invoice_request, mint_invoice_request_with_hash, note_info_request,
@@ -763,7 +763,6 @@ fn cash_derivation_vectors() {
     for case in vectors["cases"].as_array().expect("cases") {
         let name = str_of(case, "name");
         let host = str_of(case, "host");
-        let index = case["index"].as_u64().expect("index") as u32;
         let seed = hex::decode(str_of(case, "seedHex")).expect("seedHex is hex");
 
         let root = derive_cash_root(&seed).unwrap_or_else(|err| panic!("{name}: {err}"));
@@ -785,25 +784,6 @@ fn cash_derivation_vectors() {
         assert_eq!(
             cash_node_to_hex(&domain_node),
             str_of(case, "domainNode"),
-            "{name}"
-        );
-
-        let k1 = str_of(case, "k1");
-        assert_eq!(
-            derive_cash_secret(&root, &host, index).expect("secret"),
-            k1,
-            "{name}"
-        );
-        // The hardware-signer path: given only this mint's subtree, with no
-        // seed and no elliptic curve, every note index still resolves.
-        assert_eq!(
-            cash_secret_at(&domain_node, index).expect("secret"),
-            k1,
-            "{name}: from the domain node alone"
-        );
-        assert_eq!(
-            hash_k1(&k1).expect("hash"),
-            str_of(case, "noteId"),
             "{name}"
         );
     }
@@ -896,9 +876,9 @@ fn part2_branch_vectors() {
     let conventions = &vectors["conventions"];
     assert_eq!(
         conventions["addressBranch"].as_str(),
-        Some("m/139'/1'/d1/d2/d3/d4")
+        Some("m/139'/d1/d2/d3/d4")
     );
-    assert_eq!(conventions["hashingKey"].as_str(), Some("m/139'/1'/0"));
+    assert_eq!(conventions["hashingKey"].as_str(), Some("m/139'/0"));
     assert_eq!(conventions["ownershipMessage"].as_str(), Some("LNURLcash"));
     assert_eq!(
         conventions["certificateMessage"].as_str(),
@@ -934,8 +914,7 @@ fn part2_branch_vectors() {
             str_of(branch, "cashRoot"),
             "{host}"
         );
-        // the hashing key is m/139'/1'/0, so the four levels hang off m/139'/1'
-        let purpose = derive_cash_child(&root, 1 + 0x8000_0000).expect("m/139'/1'");
+        // the hashing key is m/139'/0, so the four levels hang off the root itself
         let domain_indices: Vec<u32> = branch["domainIndices"]
             .as_array()
             .expect("domainIndices")
@@ -943,9 +922,7 @@ fn part2_branch_vectors() {
             .map(|value| u32::try_from(value.as_u64().expect("index")).expect("u32"))
             .collect();
         assert_eq!(
-            cash_domain_indices(&purpose, &host)
-                .expect("indices")
-                .to_vec(),
+            cash_domain_indices(&root, &host).expect("indices").to_vec(),
             domain_indices,
             "{host}"
         );
