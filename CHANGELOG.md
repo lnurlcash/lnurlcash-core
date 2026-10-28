@@ -3,6 +3,15 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
+## 0.2.4 - 2026-10-28
+
+Security maintenance release. Updates `k256` to 0.14 and `crypto-bigint` to
+0.7.10, fixing RUSTSEC-2026-0387 timing variability in operations intended to
+be constant-time. The public LNURLcash API and wire formats are unchanged.
+
+The minimum supported Rust version is now 1.85, matching `k256` 0.14. The lock
+file also updates Rustls, WebPKI roots, Quinn and Tokio to patched releases.
+
 ## 0.2.0 - 2026-09-29
 
 Breaking. Follows LUD-25's unified taproot model (lnurl/luds `6e865b1`,

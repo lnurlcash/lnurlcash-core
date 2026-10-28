@@ -395,7 +395,7 @@ fn tweak_for(
 // tweak already below n, so k256 reduces it first.
 fn reduce_mod_n(t: [u8; 32]) -> [u8; 32] {
     use k256::elliptic_curve::ops::Reduce;
-    <k256::Scalar as Reduce<k256::U256>>::reduce_bytes(&t.into())
+    <k256::Scalar as Reduce<k256::FieldBytes>>::reduce(&t.into())
         .to_bytes()
         .into()
 }
@@ -474,7 +474,7 @@ fn legacy_ownership_digest() -> [u8; 32] {
 /// commits to a script tree by its key path, pass the tweaked key from
 /// [`crate::spend::taproot_tweak_secret_key`].
 pub fn sign_note_ownership(secret_key: &[u8; 32], domain: &str) -> Result<[u8; 96]> {
-    let key = SigningKey::from_bytes(secret_key)
+    let key = SigningKey::from_slice(secret_key)
         .map_err(|_| Error::Protocol("a note secret key is a 32-byte scalar in [1, n)".into()))?;
     let domain = spend_domain_of(domain).ok_or_else(|| {
         Error::Protocol("a ck1 is signed for a mint's domain, and that names none".into())
@@ -533,7 +533,7 @@ pub fn recover_note_ownership_pubkey(payload: &[u8], domain: &str) -> Option<Not
         return None;
     }
     let pubkey_x_only: [u8; 32] = payload[..32].try_into().ok()?;
-    let key = VerifyingKey::from_bytes(&pubkey_x_only).ok()?;
+    let key = VerifyingKey::from_slice(&pubkey_x_only).ok()?;
     let signature = SchnorrSignature::try_from(&payload[32..]).ok()?;
     let verifies = |message: &[u8]| key.verify_raw(message, &signature).is_ok();
     if spend_domain_of(domain)
@@ -876,7 +876,7 @@ mod tests {
         // that. sign_note_ownership never produces either, but a note held
         // under one must stay redeemable, at any domain, since neither names
         // one.
-        let key = SigningKey::from_bytes(&[0x22; 32]).expect("a valid key");
+        let key = SigningKey::from_slice(&[0x22; 32]).expect("a valid key");
         let expected: [u8; 32] = key.verifying_key().to_bytes().into();
         for message in [
             legacy_ownership_digest().to_vec(),

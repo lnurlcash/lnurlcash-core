@@ -1127,7 +1127,7 @@ fn address_proof_vectors() {
         assert_eq!(hex::encode(signature), str_of(proof, "signature"), "{at}");
 
         // what the SERVICE checks: BIP-340 against pk_0, over the digest
-        let verifier = k256::schnorr::VerifyingKey::from_bytes(&bytes32(proof, "indexZeroPubkey"))
+        let verifier = k256::schnorr::VerifyingKey::from_slice(&bytes32(proof, "indexZeroPubkey"))
             .expect("a key");
         let parsed = k256::schnorr::Signature::try_from(&signature[..]).expect("a signature");
         assert!(verifier
@@ -2034,7 +2034,7 @@ fn spends_checksig_vectors() {
     assert_eq!(output_key_of(&leaf, &control_block), Some(q));
     assert_eq!(encode_cp1(&q), str_of(checksig, "cp1"));
     let domain = str_of(checksig, "domain");
-    let signer = k256::schnorr::SigningKey::from_bytes(&secret).expect("a key");
+    let signer = k256::schnorr::SigningKey::from_slice(&secret).expect("a key");
 
     for spend in checksig["spends"].as_array().expect("spends") {
         let locktime = u32_of(spend, "locktime");
