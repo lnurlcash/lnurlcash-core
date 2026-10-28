@@ -773,7 +773,7 @@ pub fn parse_pay_request(body: &Value) -> Result<PayRequestInfo> {
     // something it cannot deliver, and the failure would otherwise land after
     // the caller had already paid.
     if withdraw_link.is_some()
-        && !comment_allowed.is_some_and(|allowed| allowed >= MINT_COMMENT_LENGTH)
+        && comment_allowed.is_none_or(|allowed| allowed < MINT_COMMENT_LENGTH)
     {
         return Err(Error::Protocol(
             "this mint offers no room for the required output commitment - it cannot mint".into(),

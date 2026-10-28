@@ -69,7 +69,7 @@ pub fn sign_address_proof(
     domain: &str,
     username: &str,
 ) -> crate::Result<[u8; 64]> {
-    let key = SigningKey::from_bytes(index_zero_secret_key).map_err(|_| {
+    let key = SigningKey::from_slice(index_zero_secret_key).map_err(|_| {
         crate::Error::Protocol("an index-zero secret key is a 32-byte scalar in [1, n)".into())
     })?;
     key.sign_raw(&address_proof_digest(action, domain, username)?, &[0u8; 32])
