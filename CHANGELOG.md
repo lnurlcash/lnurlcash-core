@@ -3,7 +3,27 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
-## 0.3.0 - unreleased
+## 0.3.1 - unreleased
+
+Grades against `lnurlcash-conformance` 0.16.1.
+
+- **A burned note is spent, as LUD-25 now words it.** Since luds `92abbb3` a
+  SERVICE answers a burned note exactly `already in use`, at the
+  informational GET and the callback alike. 0.3.0 read only a reason
+  containing "spent" as `Error::NoteSpent`, so against such a SERVICE a
+  spent note came back as a plain refusal, and a wallet could not tell it
+  from any other. `classify_note_error` now reads that exact reason as
+  `NoteSpent`, so it carries the fresh secrets of a mutation that may have
+  applied, as any spent refusal does.
+- The same reason also refuses an output that is already somebody's note;
+  the wording alone cannot tell the two apart. This crate's rotate, split and
+  merge mint to fresh secrets, so for them it is the spent input. A caller
+  that named its own outputs looks its inputs up to know which.
+  `Error::is_already_in_use()` matches the reason in either reading;
+  `is_output_in_use()` now matches only lnurl-mint's older `Output already
+  in use.`, which names the output.
+
+## 0.3.0 - 2026-11-03
 
 Breaking, for wallets as much as for code. Follows LUD-26 as split out of
 LUD-25 (lnurl/luds `b62b8bf` and `a6c4652`, both marked BREAKING, through

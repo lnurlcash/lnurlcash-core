@@ -178,17 +178,30 @@ impl Error {
         matches!(self, Error::Ambiguous { .. })
     }
 
-    /// Whether the SERVICE refused a mutation because its `p1` or `p2` names a
-    /// note that is outstanding or was burned: LUD-25's reason `already in
-    /// use`. Definitive, and nothing was burned. The output is somebody's note
-    /// already, typically a mint's auto-mint into the same index of a
-    /// registered branch, so retry at the next index.
+    /// Whether the SERVICE refused because an output names a note that is
+    /// outstanding or was burned: a mint invoice's comment, or lnurl-mint's
+    /// `Output already in use.` at the callback. Definitive, and nothing was
+    /// burned, so name another output.
     ///
-    /// Matched as a phrase, as lnurl-wallet does: lnurl-mint says `Output
-    /// already in use.` rather than the spec's exact wording.
+    /// LUD-25's exact `already in use` at the callback is ambiguous, since it
+    /// also answers a spend of a burned note, and [`classify_note_error`]
+    /// reads it as [`Error::NoteSpent`] so the fresh secrets stay attached;
+    /// [`Error::is_already_in_use`] matches it in either form.
     pub fn is_output_in_use(&self) -> bool {
         match self {
             Error::ServiceRejected(reason) => reason.to_ascii_lowercase().contains(OUTPUT_IN_USE),
+            _ => false,
+        }
+    }
+
+    /// Whether the SERVICE answered `already in use` (LUD-25) in any form:
+    /// either a note being spent was burned, or an output is somebody's
+    /// already. A recovery scan counts it as a used index.
+    pub fn is_already_in_use(&self) -> bool {
+        match self {
+            Error::ServiceRejected(reason) | Error::NoteSpent { reason, .. } => {
+                reason.to_ascii_lowercase().contains(OUTPUT_IN_USE)
+            }
             _ => false,
         }
     }
@@ -212,6 +225,18 @@ impl Error {
 /// possibly multi-k1 request - can only say something like "Invalid or already
 /// spent k1.", since it cannot tell which case applies to which k1.
 ///
+/// LUD-25 fixes one wording (luds `92abbb3`): a burned note is answered exactly
+/// `already in use`, at the informational GET and at the callback alike, and
+/// a LUD-26 recovery scan counts that as a used index. Every caller of this
+/// is asking about a note being spent, so that exact reason is
+/// [`Error::NoteSpent`]. The same reason also refuses a `p1`/`p2` that is
+/// already somebody's note, and from the wording alone the two are one: a
+/// caller that named its own outputs and needs to know which it was looks its
+/// inputs up. This crate's own rotate, split and merge mint to fresh secrets,
+/// which nobody else holds, so for them it is the spent input. lnurl-mint's
+/// older `Output already in use.` names the output, and stays a refusal
+/// [`Error::is_output_in_use`] recognises.
+///
 /// The reason must arrive here exactly as the SERVICE sent it, empty string
 /// included. Substituting a friendly default first would be read back as
 /// though the SERVICE had said it: "Unknown service error" matches the rule for
@@ -221,7 +246,7 @@ pub fn classify_note_error(reason: &str) -> Error {
     if lowered == "pending" {
         return Error::NotePending;
     }
-    if lowered.contains("spent") {
+    if lowered.contains("spent") || lowered.trim() == OUTPUT_IN_USE {
         return Error::NoteSpent {
             reason: reason.to_string(),
             new_secrets: Vec::new(),
@@ -251,5 +276,24 @@ mod tests {
             );
         }
         assert!(!Error::ServiceRejected("Unknown note.".into()).is_output_in_use());
+    }
+
+    /// LUD-25 answers a burned note exactly `already in use`: spent, wherever
+    /// a note is being spent or looked up. lnurl-mint's older output wording
+    /// stays an output refusal.
+    #[test]
+    fn already_in_use_is_a_spent_note_and_the_old_output_wording_is_not() {
+        for reason in ["already in use", "Already in use", " already in use "] {
+            let err = classify_note_error(reason);
+            assert!(matches!(err, Error::NoteSpent { .. }), "{reason}: {err:?}");
+            assert!(
+                err.is_already_in_use() && !err.is_output_in_use(),
+                "{reason}"
+            );
+        }
+        let err = classify_note_error("Output already in use.");
+        assert!(matches!(err, Error::ServiceRejected(_)), "{err:?}");
+        assert!(err.is_output_in_use() && err.is_already_in_use());
+        assert!(!classify_note_error("Unknown note.").is_already_in_use());
     }
 }
