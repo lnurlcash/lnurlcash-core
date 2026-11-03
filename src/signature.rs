@@ -122,7 +122,7 @@ pub fn sign_address_proof(
     username: &str,
     cx1: Option<&str>,
 ) -> crate::Result<[u8; 64]> {
-    let key = SigningKey::from_bytes(share_secret_key).map_err(|_| {
+    let key = SigningKey::from_slice(share_secret_key).map_err(|_| {
         crate::Error::Protocol("a share secret key is a 32-byte scalar in [1, n)".into())
     })?;
     key.sign_raw(
@@ -151,7 +151,7 @@ pub fn verify_address_proof(
         return false;
     };
     let (Ok(key), Ok(signature)) = (
-        VerifyingKey::from_bytes(&signer.pubkey_x_only()),
+        VerifyingKey::from_slice(&signer.pubkey_x_only()),
         SchnorrSignature::try_from(signature),
     ) else {
         return false;

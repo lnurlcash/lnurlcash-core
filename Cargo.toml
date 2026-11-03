@@ -3,7 +3,7 @@ name = "lnurlcash-core"
 # placeholder: release.yml stamps the version from the git tag at publish time
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 description = "LNURLcash (LUD-25) bearer notes - the money-critical logic, with bindings for other languages"
 license = "MIT"
 repository = "https://github.com/lnurlcash/lnurlcash-core"
@@ -23,7 +23,7 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 secp256k1 = { version = "0.33", features = ["recovery"] }
-k256 = { version = "0.13", features = ["schnorr"] }
+k256 = { version = "0.14", features = ["schnorr"] }
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
