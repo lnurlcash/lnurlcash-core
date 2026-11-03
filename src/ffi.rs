@@ -253,6 +253,9 @@ pub struct FfiMintAddress {
 pub struct FfiMintFee {
     pub base_fee_msat: u64,
     pub fee_ppm: u64,
+    /// LUD-26's fee per Lightning Address registration. Null when not
+    /// advertised: refuse to pay a registration invoice then.
+    pub address_fee_msat: Option<u64>,
 }
 
 #[derive(Debug, uniffi::Record)]
@@ -348,8 +351,10 @@ pub fn is_preimage(value: &str) -> bool {
 /// Which message a certificate verified over.
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum FfiCertifiedOver {
-    /// `hex(Q)`, LUD-25's certificate for any note.
+    /// `hex(Q)` at the note's domain, LUD-25's certificate for any note.
     OutputKey,
+    /// `hex(Q)` without a domain, as a mint signed before luds 92abbb3.
+    LegacyOutputKey,
     /// A bearer note's hash, as a mint signed before notes were keyed by `Q`.
     LegacyHash,
 }
@@ -358,6 +363,7 @@ impl From<signature::CertifiedOver> for FfiCertifiedOver {
     fn from(over: signature::CertifiedOver) -> Self {
         match over {
             signature::CertifiedOver::OutputKey => FfiCertifiedOver::OutputKey,
+            signature::CertifiedOver::LegacyOutputKey => FfiCertifiedOver::LegacyOutputKey,
             signature::CertifiedOver::LegacyHash => FfiCertifiedOver::LegacyHash,
         }
     }
@@ -418,9 +424,10 @@ impl From<signature::NoteCheck> for FfiNoteCheck {
 }
 
 /// LUD-25's offline verification as a yes or no: the certificate covers the
-/// note `k1` spends at `amount_msat`, recovering to `mint_pubkey_hex`, and
-/// the spend opens the note at `domain` (the note URL, or its host). Accepts
-/// the recovery id at either end, because implementations disagree.
+/// note `k1` spends at `domain` (the note URL, or its host) and
+/// `amount_msat`, recovering to `mint_pubkey_hex`, and the spend opens the
+/// note there. A certificate over a superseded message still counts; see
+/// [`check_note`] for which one it was.
 ///
 /// `k1` is a 64-hex preimage, a `ck1` or a `cw1`; `signature` a `cs1` or 65
 /// bytes of hex.
@@ -455,31 +462,40 @@ pub fn check_note_url(url: &str, mint_pubkey_hex: &str) -> Option<FfiNoteCheck> 
     note::check_note_url(url, mint_pubkey_hex).map(Into::into)
 }
 
-/// A certificate for a note named without its spend: a `cp1`, or a bearer
-/// note's 64-hex hash, which is also checked against the pre-taproot message
-/// over the hash. Null if neither verifies.
+/// A certificate for a note named without its spend, at `domain`: a `cp1`,
+/// or a bearer note's 64-hex hash. Falls back to the superseded messages,
+/// reported as legacy. Null if none verifies.
 #[uniffi::export]
 pub fn check_note_certificate(
     reference: &str,
+    domain: &str,
     amount_msat: u64,
     signature: &str,
     mint_pubkey_hex: &str,
 ) -> Option<FfiCertifiedOver> {
-    signature::check_note_certificate(reference, amount_msat, signature, mint_pubkey_hex)
+    signature::check_note_certificate(reference, domain, amount_msat, signature, mint_pubkey_hex)
         .map(Into::into)
 }
 
-/// The raw certificate check over exactly the 64-hex id given: `hex(Q)`, or a
-/// bearer note's hash for a pre-taproot certificate. Prefer [`check_note`] or
-/// [`check_note_certificate`], which work the id out themselves.
+/// The raw current certificate check over exactly the 64-hex `hex(Q)` given,
+/// at `domain`. Prefer [`check_note`] or [`check_note_certificate`], which
+/// work the id out themselves.
 #[uniffi::export]
 pub fn verify_note_signature_hash(
     id: &str,
+    domain: &str,
     amount_msat: u64,
-    signature_hex: &str,
+    signature: &str,
     mint_pubkey_hex: &str,
 ) -> bool {
-    signature::verify_note_signature_hash(id, amount_msat, signature_hex, mint_pubkey_hex)
+    signature::verify_note_signature_hash(id, domain, amount_msat, signature, mint_pubkey_hex)
+}
+
+/// The message a SERVICE certifies for `hex(Q)` at `domain`. Null for a
+/// domain that names none.
+#[uniffi::export]
+pub fn note_signature_message_for_hash(id: &str, domain: &str, amount_msat: u64) -> Option<String> {
+    signature::note_signature_message_for_hash(id, domain, amount_msat)
 }
 
 // ---- spends ----
@@ -714,11 +730,10 @@ pub fn derive_cash_root(seed_hex: &str) -> FfiResult<String> {
     Ok(cash::cash_node_to_hex(&cash::derive_cash_root(&seed)?))
 }
 
-/// `m/139'/d1/d2/d3/d4` for one mint, as a 64-byte hex node.
-///
-/// The same node [`derive_cash_address_node`] returns: key-path note keys
-/// hang off it. Whoever derives it can derive every note key held at that mint, so
-/// it is provisioning material - one mint's subtree, not the wallet.
+/// `m/139'/d1/d2/d3/d4` over `host` exactly as given, port included, as a
+/// 64-byte hex node. LUD-26's root is [`derive_service_root`], which drops
+/// the port first; for a host without one they are the same node. Bearer
+/// material for one mint's subtree, not the wallet.
 #[uniffi::export]
 pub fn derive_cash_domain_node(root_hex: &str, host: &str) -> FfiResult<String> {
     let root = cash::cash_node_from_hex(root_hex)?;
@@ -778,10 +793,10 @@ pub fn derive_note_secret(root_hex: &str, host: &str, index: u32) -> FfiResult<S
 // ---- key-path notes and the bech32m strings ----
 //
 // Raw bytes cross as hex, as everywhere else here, and the bech32m strings as
-// themselves. A note secret key, a `ck1`, a `cw1`, an address node and a
-// Nostr cash seed are all bearer material: store them the way the notes are
-// stored, and never log them. A `cx1` spends nothing, but links every note on
-// its branch.
+// themselves. A note secret key, a `ck1`, a `cw1`, a SERVICE root, a share
+// node and a Nostr cash seed are all bearer material: store them the way the
+// notes are stored, and never log them. A `cx1` spends nothing, but links
+// every note on its share.
 
 fn hex_array<const N: usize>(value: &str, what: &str) -> FfiResult<[u8; N]> {
     let bytes = hex::decode(value.trim())
@@ -792,18 +807,19 @@ fn hex_array<const N: usize>(value: &str, what: &str) -> FfiResult<[u8; N]> {
         .map_err(|_| errors::Error::Protocol(format!("{what} is {N} bytes, not {length}")).into())
 }
 
-/// A watch-only branch, both halves as hex.
+/// A share's xpub, both halves as hex.
 #[derive(Debug, uniffi::Record)]
 pub struct FfiCx1 {
-    pub pubkey_x_only: String,
     pub chain_code: String,
+    /// Compressed, 33 bytes.
+    pub pubkey: String,
 }
 
 impl From<recoverable::Cx1> for FfiCx1 {
     fn from(cx1: recoverable::Cx1) -> Self {
         FfiCx1 {
-            pubkey_x_only: hex::encode(cx1.pubkey_x_only),
             chain_code: hex::encode(cx1.chain_code),
+            pubkey: hex::encode(cx1.pubkey),
         }
     }
 }
@@ -913,13 +929,18 @@ pub fn is_any_cs1(value: &str) -> bool {
 }
 
 #[uniffi::export]
-pub fn encode_cx1(pubkey_x_only_hex: &str, chain_code_hex: &str) -> FfiResult<String> {
-    Ok(recoverable::encode_cx1(
-        &hex_array(pubkey_x_only_hex, "a branch pubkey")?,
-        &hex_array(chain_code_hex, "a chain code")?,
-    ))
+pub fn encode_cx1(chain_code_hex: &str, pubkey_hex: &str) -> FfiResult<String> {
+    let cx1 = recoverable::Cx1 {
+        chain_code: hex_array(chain_code_hex, "a chain code")?,
+        pubkey: hex_array(pubkey_hex, "a compressed pubkey")?,
+    };
+    // round-tripped, so a pubkey that is no point is refused here
+    recoverable::decode_cx1(&recoverable::encode_cx1(&cx1))
+        .map(|cx1| recoverable::encode_cx1(&cx1))
+        .ok_or_else(|| errors::Error::Protocol("not a compressed secp256k1 point".into()).into())
 }
 
+/// Null for anything but a 65-byte `chainCode || P`, P a curve point.
 #[uniffi::export]
 pub fn decode_cx1(value: &str) -> Option<FfiCx1> {
     recoverable::decode_cx1(value).map(Into::into)
@@ -930,38 +951,121 @@ pub fn is_cx1(value: &str) -> bool {
     recoverable::is_cx1(value)
 }
 
-/// A note's public key at `purpose` and `index`, from the watch-only half of
-/// a branch. `purpose` is 0 wallet, 1 change, 2 Lightning Address; both it and
-/// `index` are any u32 and never hardened. An unusable index is an error:
-/// use the next one.
+/// Where a note sits below a SERVICE's root (LUD-26).
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiNotePath {
+    Wallet {
+        account: u32,
+        index: u32,
+    },
+    Change {
+        account: u32,
+        index: u32,
+    },
+    Share {
+        account: u32,
+        share: u32,
+        index: u32,
+    },
+}
+
+impl From<FfiNotePath> for recoverable::NotePath {
+    fn from(path: FfiNotePath) -> Self {
+        match path {
+            FfiNotePath::Wallet { account, index } => Self::Wallet { account, index },
+            FfiNotePath::Change { account, index } => Self::Change { account, index },
+            FfiNotePath::Share {
+                account,
+                share,
+                index,
+            } => Self::Share {
+                account,
+                share,
+                index,
+            },
+        }
+    }
+}
+
+/// A note's keys, as hex. The secret key is bearer material.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiNoteKey {
+    pub secret_key: String,
+    /// Compressed, so its y parity is visible.
+    pub pubkey: String,
+    /// `Q`, the note.
+    pub output_key: String,
+}
+
+/// `S = m/139'/d1/d2/d3/d4` for one mint, from the wallet's `m/139'` root,
+/// as a 64-byte hex node. `domain` may be any URL or host; its port is
+/// dropped. Bearer material for every note the wallet holds there.
 #[uniffi::export]
-pub fn derive_note_pubkey(
-    branch_pubkey_x_only_hex: &str,
-    chain_code_hex: &str,
-    purpose: u32,
-    index: u32,
-) -> FfiResult<String> {
-    Ok(hex::encode(recoverable::derive_note_pubkey(
-        &hex_array(branch_pubkey_x_only_hex, "a branch pubkey")?,
-        &hex_array(chain_code_hex, "a chain code")?,
-        purpose,
-        index,
+pub fn derive_service_root(root_hex: &str, domain: &str) -> FfiResult<String> {
+    let root = cash::cash_node_from_hex(root_hex)?;
+    Ok(cash::cash_node_to_hex(&cash::derive_service_root(
+        &root, domain,
     )?))
 }
 
-/// The secret key behind [`derive_note_pubkey`]. Bearer material.
+/// The note at `path` below a SERVICE root.
 #[uniffi::export]
-pub fn derive_note_secret_key(
-    branch_private_key_hex: &str,
-    chain_code_hex: &str,
-    purpose: u32,
+pub fn derive_note_key(service_root_hex: &str, path: FfiNotePath) -> FfiResult<FfiNoteKey> {
+    let root = cash::cash_node_from_hex(service_root_hex)?;
+    let key = recoverable::derive_note_key(&root, path.into())?;
+    Ok(FfiNoteKey {
+        secret_key: hex::encode(key.secret_key),
+        pubkey: hex::encode(key.pubkey),
+        output_key: hex::encode(key.output_key),
+    })
+}
+
+/// `S/account'/2/share'` as a 64-byte hex node. Bearer material: hand out
+/// its [`cash_node_to_cx1`], and sign its registration with its key.
+#[uniffi::export]
+pub fn derive_share_node(service_root_hex: &str, account: u32, share: u32) -> FfiResult<String> {
+    let root = cash::cash_node_from_hex(service_root_hex)?;
+    Ok(cash::cash_node_to_hex(&recoverable::derive_share_node(
+        &root, account, share,
+    )?))
+}
+
+/// `Q` of note `index` on the share a `cx1` exports, by CKDpub: what a
+/// SERVICE credits next. An unusable index is an error: use the next one.
+#[uniffi::export]
+pub fn derive_note_pubkey(cx1: &str, index: u32) -> FfiResult<String> {
+    let cx1 = recoverable::decode_cx1(cx1)
+        .ok_or_else(|| errors::Error::Protocol("that is not a cx1".into()))?;
+    Ok(hex::encode(recoverable::derive_note_pubkey(&cx1, index)?))
+}
+
+/// Superseded: `Q` under the per-note tweak before LUD-26, from a 64-byte
+/// legacy `cx1`, for finding notes to sweep. `purpose` null is the scheme
+/// before purposes existed.
+#[uniffi::export]
+pub fn legacy_derive_note_pubkey(
+    legacy_cx1: &str,
+    purpose: Option<u32>,
     index: u32,
 ) -> FfiResult<String> {
-    Ok(hex::encode(recoverable::derive_note_secret_key(
-        &hex_array(branch_private_key_hex, "a branch private key")?,
-        &hex_array(chain_code_hex, "a chain code")?,
-        purpose,
-        index,
+    let cx1 = recoverable::decode_legacy_cx1(legacy_cx1)
+        .ok_or_else(|| errors::Error::Protocol("that is not a legacy cx1".into()))?;
+    Ok(hex::encode(recoverable::legacy_derive_note_pubkey(
+        &cx1, purpose, index,
+    )?))
+}
+
+/// Superseded: the secret key behind [`legacy_derive_note_pubkey`], from a
+/// [`legacy_branch_node`]. Bearer material.
+#[uniffi::export]
+pub fn legacy_derive_note_secret_key(
+    node_hex: &str,
+    purpose: Option<u32>,
+    index: u32,
+) -> FfiResult<String> {
+    let node = cash::cash_node_from_hex(node_hex)?;
+    Ok(hex::encode(recoverable::legacy_derive_note_secret_key(
+        &node, purpose, index,
     )?))
 }
 
@@ -976,21 +1080,47 @@ pub fn sign_note_ownership(secret_key_hex: &str, domain: &str) -> FfiResult<Stri
     )?))
 }
 
-/// A register or unregister proof by the branch's index-0 key, bound to the
-/// service's `domain`, as raw 64-byte BIP-340 Schnorr signature hex.
+/// A register, update or unregister proof by a share's own key, bound to the
+/// service's `domain`, the lowercased username and, for register and update,
+/// the `cx1` put on file, as raw 64-byte BIP-340 signature hex.
 #[uniffi::export]
 pub fn sign_address_proof(
-    index_zero_secret_key_hex: &str,
+    share_secret_key_hex: &str,
     action: &str,
     domain: &str,
     username: &str,
+    cx1: Option<String>,
 ) -> FfiResult<String> {
     Ok(hex::encode(signature::sign_address_proof(
-        &hex_array(index_zero_secret_key_hex, "an index-zero secret key")?,
+        &hex_array(share_secret_key_hex, "a share secret key")?,
         action,
         domain,
         username,
+        cx1.as_deref(),
     )?))
+}
+
+/// What a SERVICE checks: a proof by `signer_cx1`'s key over this action's
+/// message.
+#[uniffi::export]
+pub fn verify_address_proof(
+    signer_cx1: &str,
+    signature_hex: &str,
+    action: &str,
+    domain: &str,
+    username: &str,
+    cx1: Option<String>,
+) -> bool {
+    hex::decode(signature_hex.trim()).is_ok_and(|signature| {
+        signature::verify_address_proof(
+            signer_cx1,
+            &signature,
+            action,
+            domain,
+            username,
+            cx1.as_deref(),
+        )
+    })
 }
 
 /// A verified `ck1` payload's note key, and whether it was signed under a
@@ -1030,24 +1160,35 @@ pub fn note_lookup_of(k1: &str) -> Option<String> {
     recoverable::note_lookup_of(k1)
 }
 
-/// `m/139'/d1/d2/d3/d4` for one mint, as a 64-byte hex node: the domain node
-/// this section's Seed & derivation formula specifies. Bearer material - hand
-/// out its `cx1`.
+/// A share node's `cx1`.
 #[uniffi::export]
-pub fn derive_cash_address_node(root_hex: &str, host: &str) -> FfiResult<String> {
-    let root = cash::cash_node_from_hex(root_hex)?;
-    Ok(cash::cash_node_to_hex(
-        &recoverable::derive_cash_address_node(&root, host)?,
-    ))
-}
-
-#[uniffi::export]
-pub fn cash_node_to_cx1(node_hex: &str) -> FfiResult<FfiCx1> {
+pub fn cash_node_to_cx1(node_hex: &str) -> FfiResult<String> {
     let node = cash::cash_node_from_hex(node_hex)?;
-    Ok(recoverable::cash_node_to_cx1(&node)?.into())
+    Ok(recoverable::encode_cx1(&recoverable::cash_node_to_cx1(
+        &node,
+    )?))
 }
 
-/// Not LUD-25: the cash seed of a Nostr identity key. Bearer material.
+/// Superseded: the node the per-note tweak hung off, `m/139'/d1..d4` over the
+/// host as stored, port included. Bearer material, for sweeping only.
+#[uniffi::export]
+pub fn legacy_branch_node(root_hex: &str, host: &str) -> FfiResult<String> {
+    let root = cash::cash_node_from_hex(root_hex)?;
+    Ok(cash::cash_node_to_hex(&recoverable::legacy_branch_node(
+        &root, host,
+    )?))
+}
+
+/// Superseded: a [`legacy_branch_node`]'s 64-byte `cx1`.
+#[uniffi::export]
+pub fn legacy_cx1_of(node_hex: &str) -> FfiResult<String> {
+    let node = cash::cash_node_from_hex(node_hex)?;
+    Ok(recoverable::encode_legacy_cx1(&recoverable::legacy_cx1_of(
+        &node,
+    )?))
+}
+
+/// Not LUD-26: the cash seed of a Nostr identity key. Bearer material.
 #[uniffi::export]
 pub fn derive_nostr_cash_seed(secret_key_hex: &str) -> FfiResult<String> {
     Ok(hex::encode(recoverable::derive_nostr_cash_seed(
@@ -1055,14 +1196,14 @@ pub fn derive_nostr_cash_seed(secret_key_hex: &str) -> FfiResult<String> {
     )))
 }
 
-/// Not LUD-25: one mint's address branch for a Nostr identity key, as a
-/// 64-byte hex node. Bearer material - hand out its `cx1`.
+/// Not LUD-26: one mint's root `S` for a Nostr identity key, as a 64-byte
+/// hex node. Bearer material.
 #[uniffi::export]
-pub fn derive_nostr_address_node(secret_key_hex: &str, host: &str) -> FfiResult<String> {
+pub fn derive_nostr_service_root(secret_key_hex: &str, domain: &str) -> FfiResult<String> {
     Ok(cash::cash_node_to_hex(
-        &recoverable::derive_nostr_address_node(
+        &recoverable::derive_nostr_service_root(
             &hex_array(secret_key_hex, "a Nostr secret key")?,
-            host,
+            domain,
         )?,
     ))
 }
@@ -1141,10 +1282,7 @@ pub fn without_k1(url: &str, amount_msat: u64, signature: Option<String>) -> Opt
 
 #[uniffi::export]
 pub fn parse_mint_fee(metadata: &str) -> Option<FfiMintFee> {
-    fees::parse_mint_fee(metadata).map(|fee| FfiMintFee {
-        base_fee_msat: fee.base_fee_msat,
-        fee_ppm: fee.fee_ppm,
-    })
+    fees::parse_mint_fee(metadata).map(Into::into)
 }
 
 #[uniffi::export]
@@ -1167,6 +1305,17 @@ impl From<FfiMintFee> for fees::MintFee {
         fees::MintFee {
             base_fee_msat: fee.base_fee_msat,
             fee_ppm: fee.fee_ppm,
+            address_fee_msat: fee.address_fee_msat,
+        }
+    }
+}
+
+impl From<fees::MintFee> for FfiMintFee {
+    fn from(fee: fees::MintFee) -> Self {
+        FfiMintFee {
+            base_fee_msat: fee.base_fee_msat,
+            fee_ppm: fee.fee_ppm,
+            address_fee_msat: fee.address_fee_msat,
         }
     }
 }
@@ -1241,6 +1390,27 @@ pub fn verify_request(verify_url: &str) -> FfiResult<FfiRequest> {
 #[uniffi::export]
 pub fn melt_request(callback: &str, k1: &str, pr: &str) -> FfiResult<FfiRequest> {
     Ok(protocol::melt_request(callback, k1, pr)?.into())
+}
+
+/// LUD-26's internal transfer: send a whole note to a Lightning Address at
+/// the note's own mint. `pay_request_body` is the address's payRequest JSON;
+/// refused unless its `withdrawLink` is on `note_domain`.
+#[uniffi::export]
+pub fn internal_transfer_request(
+    pay_request_body: &str,
+    note_domain: &str,
+    k1: &str,
+    amount_msat: u64,
+) -> FfiResult<FfiRequest> {
+    let info = protocol::parse_pay_request(&parse_body(pay_request_body)?)?;
+    Ok(protocol::internal_transfer_request(&info, note_domain, k1, amount_msat)?.into())
+}
+
+/// The answer to an [`internal_transfer_request`]. An ambiguous error means
+/// the note may already be spent.
+#[uniffi::export]
+pub fn parse_internal_transfer(body: &str) -> FfiResult<()> {
+    Ok(protocol::parse_internal_transfer(&parse_body(body)?)?)
 }
 
 /// Rotate. `new_secret` is generated by the CALLER - use
@@ -1369,10 +1539,7 @@ pub fn parse_pay_request(body: &str) -> FfiResult<FfiPayRequest> {
         withdraw_link: info.withdraw_link,
         mint_pubkey: info.mint_pubkey,
         names_mint_output,
-        mint_fee: info.mint_fee.map(|fee| FfiMintFee {
-            base_fee_msat: fee.base_fee_msat,
-            fee_ppm: fee.fee_ppm,
-        }),
+        mint_fee: info.mint_fee.map(Into::into),
         comment_allowed: info.comment_allowed,
         mint_to_hash: info.mint_to_hash,
     })

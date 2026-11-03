@@ -92,20 +92,24 @@ check_note_certificate(cp1 or bearer h, amount, sig, mint_pubkey) ->
   Option<CertifiedOver::{OutputKey, LegacyHash}>   LegacyHash = a
   pre-taproot certificate over h
 verify_note_signature_hash(id, ..) -> bool   raw: over exactly this 64-hex id
-cs1 message: "LNURLcash:" || amount_msat || ":" || hex(Q), Lightning
-  signmessage digest, r||s||recid (either recid end accepted). An
-  amount-bearing cs1 must state the amount it signs in its HRP.
+cs1 message: "LNURLcash:" || domain || ":" || amount_msat || ":" || hex(Q),
+  Lightning signmessage digest, r||s||recid, recid 0..3. An amount-bearing
+  cs1 must state the amount it signs in its HRP. Read only, reported as
+  legacy: the message without the domain (CertifiedOver::LegacyOutputKey,
+  either recid end), and over a bearer h (CertifiedOver::LegacyHash).
 
-cash::derive_cash_root(seed) -> CashNode        LUD-25's scheme, BIP-32 m/139'
-cash::derive_cash_domain_node(root, host)       m/139'/d1/d2/d3/d4, d1..d4 =
-  HMAC-SHA256(privkey at m/139'/0, host)[0..16] as 4 RAW big-endian uint32.
-  RAW: BIP-32 reads >= 2^31 as hardened, so ~half the levels are, decided by
-  the host name. NEVER mask the top bit, NEVER harden all four - either
-  derives a different tree and restores nothing, silently.
+cash::derive_cash_root(seed) -> CashNode        BIP-32 m/139'
+cash::derive_service_root(root, domain) -> S    LUD-26: m/139'/d1/d2/d3/d4,
+  d1..d4 = HMAC-SHA256(privkey at m/139'/0, domain)[0..16] as 4 RAW
+  big-endian uint32, domain = lowercase hostname, NO port (any URL or host
+  is reduced to it). RAW: BIP-32 reads >= 2^31 as hardened, so ~half the
+  levels are, decided by the domain. NEVER mask the top bit, NEVER harden
+  all four - either derives a different tree and restores nothing, silently.
   Bearer notes are NOT derived from the seed (their preimage is plain
-  randomness). Key-path note keys hang off this node: see
-  derive_cash_address_node below.
-  Bearer material for every note key at that mint.
+  randomness). Bearer material for every note key at that mint.
+cash::derive_cash_domain_node(root, host)       the same walk over the host
+  AS STORED, port included: the superseded schemes' node
+cash::derive_cash_child_pub(P33, chain_code, i) BIP-32 CKDpub, non-hardened only
 cash::cash_domain_indices(root, host) -> [u32; 4]   the raw d1..d4
 cash::cash_node_to_hex / from_hex     privateKey || chainCode, 64 bytes
 cash::derive_cash_child(node, raw_u32)          BIP-32 CKDpriv, for checking
@@ -132,20 +136,24 @@ encode_cw1/decode_cw1/is_cw1   script-path spend, Cw1 { locktime, sequence,
   and a control block committing to no key. Cw1::output_key()
 encode_cs1_with_amount/decode_cs1_with_amount   mint certificate, "cs" +
   BOLT-11 amount; encode_cs1/decode_cs1 the legacy fixed "cs"
-encode_cx1/decode_cx1/is_cx1   watch-only branch Cx1 { pubkey_x_only,
-  chain_code }, "cx". Decoders return None, never panic. No 90-char limit;
-  all-uppercase accepted; mixed case, a bech32 (not bech32m) checksum, the
-  wrong hrp or length and non-zero padding refused (BIP-350)
-derive_cash_address_node(root, host) -> CashNode   the domain node itself:
-  m/139'/d1/d2/d3/d4, hashing key m/139'/0, the spec text's literal path.
-  Derived from the host AS STORED (port included); spends bind the hostname
-cash_node_to_cx1(node) -> Cx1
-derive_note_pubkey(P, chain_code, purpose, i) -> Q   watch-only, BIP-341 style
-  tweak over ser32(purpose)||ser32(i); purpose = PURPOSE_WALLET 0, PURPOSE_CHANGE 1,
-  PURPOSE_LIGHTNING_ADDRESS 2 (registration proof and address key: purpose 0, index 0); i any u32, 4-byte big-endian, never hardened. t is reduced mod n;
-  a key at infinity is an error: use the next index. Q is used as is, no BIP-86 tweak
-derive_note_secret_key(p, chain_code, purpose, i) -> sk   negates p first when P has
-  odd y
+encode_cx1/decode_cx1/is_cx1   a share's xpub, Cx1 { chain_code, pubkey
+  (33, compressed) }, "cx", 65 bytes, 113 chars; decode refuses a pubkey that
+  is not a compressed point and the old 64-byte shape. Decoders return None,
+  never panic. No 90-char limit; all-uppercase accepted; mixed case, a bech32
+  (not bech32m) checksum, the wrong hrp or length and non-zero padding
+  refused (BIP-350)
+LUD-26 tree below S, plain BIP-32: wallet S/a'/0/i, change S/a'/1/i, share
+  S/a'/2/n' (its cx1), share notes S/a'/2/n'/i (only the SERVICE picks i).
+  Accounts and shares hardened; i < 2^31. Q = x(sk·G), no BIP-86 tweak
+derive_note_key(S, NotePath::{Wallet{account,index}, Change{..},
+  Share{account,share,index}}) -> NoteKey { secret_key, pubkey (33), output_key Q }
+derive_share_node(S, account, share) -> CashNode; cash_node_to_cx1(node) -> Cx1
+derive_note_pubkey(&Cx1, i) -> Q    CKDpub, what a SERVICE credits next
+LEGACY, sweep only (before luds a6c4652): legacy_branch_node(root, host),
+  legacy_cx1_of(node) -> LegacyCx1 (64-byte x(P)||chaincode),
+  encode_/decode_legacy_cx1, legacy_derive_note_pubkey(&LegacyCx1, purpose,
+  i), legacy_derive_note_secret_key(node, purpose, i); purpose None = before
+  purposes, else LEGACY_PURPOSE_WALLET 0 / _CHANGE 1 / _LIGHTNING_ADDRESS 2
 sign_note_ownership(sk, domain) -> [u8; 96]   Q || BIP-340 over
   key_path_sighash(Q, domain), zero aux_rand: one ck1 per key per mint,
   reproduced by seed recovery. domain = note URL, mint URL or bare host
@@ -160,18 +168,26 @@ Wire: any spend goes wherever a k1 does. Every output goes as p1/p2 (a cp1
   sending. mint_invoice_request_with_hash: the comment (a hash also sends h).
   Lookups go as ?p=. parse_note_info compares an echoed k1 by the note it
   names, and refuses another spend of it that fails at the queried domain.
-derive_nostr_cash_seed(sk) / derive_nostr_address_node(sk, host)   NOT
-  LUD-25: a branch from a Nostr identity key, via
-  HMAC-SHA256(key = sk, msg = "LNURLcash/nostr-seed"), then the address path
+derive_nostr_cash_seed(sk) / derive_nostr_service_root(sk, domain)   NOT
+  LUD-26: the tree from a Nostr identity key, via
+  HMAC-SHA256(key = sk, msg = "LNURLcash/nostr-seed"), then S from that seed
 resolve_note_input / resolve_mint_input / resolve_lnurl_input
-parse_mint_fee / apply_mint_fee / gross_up_for_mint_fee
+parse_mint_fee / apply_mint_fee / gross_up_for_mint_fee   "Mint fees: <base>,
+  <ppm>[,<address fee>]" anywhere in text/plain, values end at whitespace;
+  MintFee::address_fee_msat is LUD-26's third value (None: refuse to pay)
+internal_transfer_request(pay_request, note_domain, k1, amount_msat) /
+  parse_internal_transfer   LUD-26: a whole note to a Lightning Address's
+  callback at the note's own mint; refused unless withdrawLink is on it
 build_note_url / with_new_k1 / without_k1
-address_proof_message(action, domain, username) /
-  address_proof_digest(action, domain, username)
-sign_address_proof(index_zero_sk, action, domain, username)
-  message: LNURLcash:<register|unregister>:<domain>:<normalised username>
-  domain = the SERVICE's hostname; wire signature: raw 64-byte BIP-340 over
-  sha256(message); key is address branch index 0
+address_proof_message(action, domain, username, cx1) /
+  address_proof_digest(action, domain, username, cx1)
+sign_address_proof(share_sk, action, domain, username, cx1) /
+  verify_address_proof(signer_cx1, sig, action, domain, username, cx1)
+  messages: LNURLcash:register:<domain>:<username>:<cx1>,
+  LNURLcash:update:<domain>:<username>:<new cx1> (by the key on file),
+  LNURLcash:unregister:<domain>:<username> (cx1 None); username lowercased,
+  domain = the SERVICE's hostname; raw 64-byte BIP-340 over sha256(message)
+  by the share's own key, verified against x(P) of the signer's cx1
 decode_bolt11_amount_msat / is_bolt11_invoice / same_invoice
 
 client::Client::{fetch_note_info, fetch_note_info_by_hash, rotate_note,

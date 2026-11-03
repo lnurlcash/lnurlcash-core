@@ -1,45 +1,48 @@
-//! LUD-25's `m/139'` branch derivation: the BIP-32 walk from a wallet's cash
-//! root down to a per-`SERVICE` domain node, exactly as its "Seed &
-//! derivation" section specifies it:
+//! The `m/139'` BIP-32 walk from a wallet's seed down to one `SERVICE`'s
+//! root, as LUD-26's "Seed & derivation" specifies it:
 //!
 //! ```text
 //! cashHashingKey   = derive(masterKey, m/139'/0)
-//! domainMaterial   = hmacSha256(cashHashingKey, full SERVICE domain)
+//! domainMaterial   = hmacSha256(cashHashingKey, domain)
 //! (d1, d2, d3, d4) = first 16 bytes of domainMaterial as 4 uint32
-//! domainNode       = derive(masterKey, m/139'/d1/d2/d3/d4)
+//! S                = derive(masterKey, m/139'/d1/d2/d3/d4)
 //! ```
 //!
-//! "exactly as LUD-05", says the draft of the middle two lines, and that
-//! reference is what settles the one thing the path shape leaves open.
-//! `d1..d4` are raw uint32 drawn from a hash, and BIP-32 already reads any
-//! index >= 2^31 as hardened, so roughly half of any given mint's four levels
-//! are hardened by magnitude alone. They are used exactly as they fall:
-//! nothing is masked, and nothing is forced hardened. That is what LUD-05's
-//! own corpus does with the same four longs, and what the reference wallet
-//! does.
+//! "as LUD-05", says the draft of the middle two lines, and that reference is
+//! what settles the one thing the path shape leaves open. `d1..d4` are raw
+//! uint32 drawn from a hash, and BIP-32 already reads any index >= 2^31 as
+//! hardened, so roughly half of any given mint's four levels are hardened by
+//! magnitude alone. They are used exactly as they fall: nothing is masked,
+//! and nothing is forced hardened. That is what LUD-05's own corpus does with
+//! the same four longs, and what the reference wallet does.
 //!
 //! An implementation that masks the top bit, or hardens all four, derives a
 //! different tree from every conforming wallet - and a restore against it
 //! finds nothing, silently, and only once the money is gone.
 //!
-//! Bearer-note preimages are NOT derived from this node, or from the seed at
-//! all - LUD-25 has `WALLET` generate plain randomness, and back them up by
-//! other means. An earlier reference-wallet extension did derive them
-//! deterministically from a sibling of this branch, hardened at the note's
-//! own index; it has since been dropped as unspecified, and this module no
-//! longer provides it.
-//! [`crate::secrets`]' legacy scheme (HMAC-SHA256 under `lnurlcash-note-v1`,
-//! predating LUD-25 entirely) is still derived and still scanned on restore
-//! forever, so nothing already minted under either scheme goes missing.
+//! `domain` is the string the canonical spend transaction commits to: the
+//! mint's lowercase hostname, never its port (see [`derive_service_root`]).
+//! Everything below `S` is plain BIP-32 too, laid out in
+//! [`crate::recoverable`].
 //!
-//! The key-path notes' address branch is this exact domain node, for the
-//! same host: see [`crate::recoverable::derive_cash_address_node`].
+//! [`derive_cash_domain_node`] is the same walk over the host exactly as the
+//! wallet stored it, port included. That is the node the superseded tweak
+//! schemes hung their notes off, kept so a wallet can still sweep them (see
+//! [`crate::recoverable::legacy_branch_node`]).
+//!
+//! Bearer-note preimages are NOT derived from this tree, or from the seed at
+//! all - LUD-25 has `WALLET` generate plain randomness, and back them up by
+//! other means. [`crate::secrets`]' legacy scheme (HMAC-SHA256 under
+//! `lnurlcash-note-v1`, predating LUD-25 entirely) is still derived and still
+//! scanned on restore forever, so nothing already minted under it goes
+//! missing.
 
 use hmac::{Hmac, Mac};
 use secp256k1::{PublicKey, Scalar, SecretKey};
 use sha2::{Sha256, Sha512};
 
 use crate::errors::{Error, Result};
+use crate::spend::spend_domain_of;
 
 type HmacSha512 = Hmac<Sha512>;
 type HmacSha256 = Hmac<Sha256>;
@@ -128,6 +131,50 @@ pub fn derive_cash_child(node: &CashNode, index: u32) -> Result<CashNode> {
     })
 }
 
+/// One BIP-32 CKDpub step from a compressed public key and its chain code:
+/// what a SERVICE holding only a share's `cx1` derives each of its notes
+/// with. A hardened `index` is refused, since only the private key can take
+/// one.
+pub fn derive_cash_child_pub(
+    pubkey: &[u8; 33],
+    chain_code: &[u8; 32],
+    index: u32,
+) -> Result<([u8; 33], [u8; 32])> {
+    if index >= HARDENED {
+        return Err(Error::Protocol(format!(
+            "a public key has no hardened child, and {index} is one"
+        )));
+    }
+    let parent = PublicKey::from_byte_array_compressed(*pubkey)
+        .map_err(|_| Error::Protocol("not a compressed secp256k1 point".into()))?;
+
+    let mut data = [0u8; 37];
+    data[..33].copy_from_slice(pubkey);
+    data[33..].copy_from_slice(&index.to_be_bytes());
+    let material = hmac512(chain_code, &data);
+    let mut left = [0u8; 32];
+    left.copy_from_slice(&material[..32]);
+
+    // the same two ~2^-127 failures as CKDpriv, here a tweak at or above the
+    // group order and a child at infinity
+    let tweak = Scalar::from_be_bytes(left)
+        .map_err(|_| Error::Protocol(format!("BIP-32 derivation at {index} is out of range")))?;
+    let child = parent
+        .add_exp_tweak(&tweak)
+        .map_err(|_| Error::Protocol(format!("BIP-32 derivation at {index} is out of range")))?;
+
+    let mut child_chain_code = [0u8; 32];
+    child_chain_code.copy_from_slice(&material[32..]);
+    Ok((child.serialize(), child_chain_code))
+}
+
+/// A node's compressed public key, `P` in BIP-32's terms.
+pub fn cash_node_public_key(node: &CashNode) -> Result<[u8; 33]> {
+    let key = SecretKey::from_secret_bytes(node.private_key)
+        .map_err(|_| Error::Protocol("cash node holds an invalid private key".into()))?;
+    Ok(PublicKey::from_secret_key(&key).serialize())
+}
+
 /// The BIP-32 master node of a seed. Public beside [`derive_cash_child`] for
 /// the same reason: a consumer walking a path this crate does not name starts
 /// here.
@@ -186,27 +233,35 @@ pub fn cash_domain_indices(root: &CashNode, host: &str) -> Result<[u32; 4]> {
     Ok(out)
 }
 
-/// `m/139'/d1/d2/d3/d4` for one mint: everything above a note's own index.
+/// `m/139'/d1/d2/d3/d4` over `host` exactly as given, port included: the
+/// node the superseded tweak schemes derived their notes from. LUD-26's root
+/// is [`derive_service_root`], which hashes the domain without its port; for
+/// a host without one the two are the same node.
 ///
-/// Its own step because it is the unit a signer is provisioned with, and the
-/// node the key-path address branch is (see
-/// [`crate::recoverable::derive_cash_address_node`]). It does not spare a
-/// signer the curve: the per-note tweak beneath it, and the `ck1` signature,
-/// both need secp256k1.
-///
-/// Whoever derives it can derive every note key the wallet will ever hold AT
-/// THIS MINT, so it is provisioning material rather than something to hand
-/// out: one mint's subtree, not the wallet.
-///
-/// `host` is the mint host exactly as the wallet stores it - lowercase, port
-/// included where there is one - which is what the reference wallet passes, so
-/// the two derive the same tree.
+/// Whoever derives it can derive every note key the wallet held under those
+/// schemes AT THIS MINT, so it is bearer material for one mint's subtree.
 pub fn derive_cash_domain_node(root: &CashNode, host: &str) -> Result<CashNode> {
     let mut node = root.clone();
     for index in cash_domain_indices(root, host)? {
         node = derive_cash_child(&node, index)?;
     }
     Ok(node)
+}
+
+/// `S = m/139'/d1/d2/d3/d4`, one SERVICE's LUD-26 root, from the wallet's
+/// `m/139'` root ([`derive_cash_root`]).
+///
+/// `domain` may be a mint URL, a note URL or a bare host: it is reduced to
+/// the lowercase hostname without scheme or port, the same string every
+/// signature at that mint commits to. A domain hosts exactly one mint, so
+/// seed plus domain recovers everything a wallet holds there.
+///
+/// Bearer material for every note the wallet will ever hold at this mint:
+/// a wallet hands out a share's `cx1`, never this node.
+pub fn derive_service_root(root: &CashNode, domain: &str) -> Result<CashNode> {
+    let domain = spend_domain_of(domain)
+        .ok_or_else(|| Error::Protocol("a SERVICE root is derived for a domain".into()))?;
+    derive_cash_domain_node(root, &domain)
 }
 
 /// privateKey || chainCode, 64 bytes of hex. Not a BIP-32 extended key: no

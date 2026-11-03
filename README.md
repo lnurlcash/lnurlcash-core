@@ -240,25 +240,36 @@ the note you hand over `ck1<Q || sig>`, a BIP-340 signature by `sk` over the
 key-path sighash for that mint's domain, with an all-zero auxiliary input: one
 key has exactly one `ck1` per mint, and seed recovery reproduces it byte for
 byte. The mint's certificate, `cs1`, carries the amount in its human-readable
-part and the mint's signature over that amount and `hex(Q)`.
+part and the mint's signature over its domain, that amount and `hex(Q)`.
+
+Keys are plain BIP-32 below each mint's root (LUD-26):
+
+```text
+S            = m/139'/d1/d2/d3/d4    LUD-05's steps over the domain, no port
+S/a'/0/i     wallet: every note you mint, rotate or merge into, and a split's p1
+S/a'/1/i     change: a split's p2
+S/a'/2/n'    share n, handed out as its cx1 (an xpub)
+S/a'/2/n'/i  note i of share n, picked and credited by the mint
+```
 
 ```rust
-use lnurlcash_core::cash::derive_cash_root;
+use lnurlcash_core::cash::{derive_cash_root, derive_service_root};
 use lnurlcash_core::recoverable::*;
 use lnurlcash_core::check_note;
 
-let node = derive_cash_address_node(&derive_cash_root(&seed)?, "mint.example")?;
-let branch = cash_node_to_cx1(&node)?;
-let cx1 = encode_cx1(&branch.pubkey_x_only, &branch.chain_code); // watch-only
-
-// purpose: PURPOSE_WALLET (0), PURPOSE_CHANGE (1) or PURPOSE_LIGHTNING_ADDRESS (2)
-let pk = derive_note_pubkey(&branch.pubkey_x_only, &branch.chain_code, PURPOSE_WALLET, i)?; // what a watcher derives
-let sk = derive_note_secret_key(&node.private_key, &node.chain_code, PURPOSE_WALLET, i)?;
-let ck1 = encode_ck1(&sign_note_ownership(&sk, note_url)?); // spends it at this mint only
+let root = derive_service_root(&derive_cash_root(&seed)?, "mint.example")?;
+let key = derive_note_key(&root, NotePath::Wallet { account: 0, index: i })?;
+let cp1 = encode_cp1(&key.output_key); // what the mint sees
+let ck1 = encode_ck1(&sign_note_ownership(&key.secret_key, note_url)?); // spends it at this mint only
 
 let cs1 = encode_cs1_with_amount(amount_msat, &mint_signature);
 let check = check_note(&ck1, note_url, amount_msat, &cs1, &mint_pubkey); // offline
 assert!(check.is_some_and(|check| check.is_verified()));
+
+// a share, for a Lightning Address: hand out its cx1, never the node
+let share = derive_share_node(&root, 0, n)?;
+let cx1 = encode_cx1(&cash_node_to_cx1(&share)?);
+let q = derive_note_pubkey(&decode_cx1(&cx1).unwrap(), i)?; // what the mint credits, by CKDpub
 ```
 
 A `cp1` whose key is not a curve point is refused everywhere: no spend could
@@ -266,34 +277,33 @@ ever open it, so a note minted to one is value destroyed. To spend a note
 whose `Q` commits to a script tree by its key path, sign with
 `spend::taproot_tweak_secret_key`.
 
-The fixed-HRP `encode_cs1`/`decode_cs1` functions remain available for notes
-certified before the amount-bearing form; `decode_any_cs1` accepts either. A
-certificate from a mint that predates taproot is over a bearer note's `h`
-rather than its `Q`; `check_note` and `check_note_certificate` still read it,
-and say so (`CertifiedOver::LegacyHash`).
-
-A note's tweak is `tagged_hash("LNURLcash/derive", P || chaincode ||
-ser32(purpose) || ser32(i))`. `purpose` keeps three counters apart on one
-branch: `PURPOSE_WALLET` (0) for the wallet's own notes and a split's `p1`,
-`PURPOSE_CHANGE` (1) for a split's change `p2`, and
-`PURPOSE_LIGHTNING_ADDRESS` (2) for notes a SERVICE credits by Lightning
-Address auto-mint or internal transfer. One `cx1` covers all three; scan each
-with its own gap limit on restore.
-
 Certificates travel as `c` (and `c2` for a split's change) in withdraw
 responses and the informational GET, and a certified note URL carries
 `&c=<cs1>`. Reading still accepts the legacy `sig`, `sig2` and `&sig=`; only
-`c`, `c2` and `&c=` are written. The registration proof's request parameter
-stays `sig`.
+`c`, `c2` and `&c=` are written. A current `cs1` is `r || s || recovery-id`
+with the recovery id 0 to 3. `check_note` and `check_note_certificate` still
+read the certificates older mints issued, and say so: over `hex(Q)` without
+the domain (`CertifiedOver::LegacyOutputKey`), or over a bearer note's `h`
+before notes were keyed by `Q` (`CertifiedOver::LegacyHash`). The fixed-HRP
+`encode_cs1`/`decode_cs1` remain for notes certified before the
+amount-bearing form; `decode_any_cs1` accepts either.
 
-Registering or unregistering a Lightning Address uses the branch's purpose-0
-index-0 private key. `sign_address_proof(&sk0, action, domain, username)` returns the
-raw 64-byte BIP-340 proof over
-`sha256("LNURLcash:<action>:<domain>:<username>")` (`address_proof_message`
-builds the string, `address_proof_digest` the 32 bytes that are signed);
-action is `register` or `unregister`, `domain` is the SERVICE's hostname, so a
-proof one SERVICE saw cannot be replayed at another, and the username must be
-normalised exactly as it is sent.
+A share's own key proves a Lightning Address registration:
+`sign_address_proof(&share.private_key, action, domain, username, cx1)` returns
+the raw 64-byte BIP-340 proof over
+`sha256("LNURLcash:register:<domain>:<username>:<cx1>")`,
+`sha256("LNURLcash:update:<domain>:<username>:<new cx1>")` (by the key on file;
+a PUT also carries a register proof by the new share) or
+`sha256("LNURLcash:unregister:<domain>:<username>")`. `domain` is the
+SERVICE's hostname, so a proof one SERVICE saw cannot be replayed at another,
+and the username is lowercased. `verify_address_proof` is the SERVICE's side:
+it checks against `x(P)` of the signer's `cx1`.
+
+`internal_transfer_request` pays a Lightning Address at the note's own mint
+with the whole note, sent to the address's payRequest callback, and refuses
+before anything is sent unless the address's `withdrawLink` is on the note's
+domain. `parse_mint_fee` reads LUD-26's address fee, the third `Mint fees`
+value, into `MintFee::address_fee_msat`.
 
 The wire takes every kind. Any spend goes anywhere a k1 does. An output goes
 as `p1`/`p2`, a `cp1` or a bearer note's hash alike, and the
@@ -308,25 +318,34 @@ new legacy values.
 
 Three things worth knowing:
 
-- **The branch is the domain node itself**, the draft's literal
-  `m/139'/d1/d2/d3/d4`, with the hashing key at `m/139'/0`. Earlier versions
-  inserted a `1'` hop (`m/139'/1'/...`); keys derived under that hop are not
-  on this branch.
-- **A `cx1` links every note on its branch.** It spends nothing, but whoever
-  holds it can list every key on the branch and ask the mint about each one.
-- **`i` is any u32**, serialised as 4 bytes big-endian, never hardened. A tweak
-  at or above the curve order is an error rather than reduced: use the next
-  index.
+- **Accounts and shares are hardened, note indices are not.** An index is
+  below 2^31; a share's `cx1` lets whoever holds it list every note on that
+  share, and nothing else. Use a fresh share per party, and rotate what
+  arrives on one into a wallet note.
+- **The root hashes the domain, not the host as stored.** `localhost:3338`
+  and `localhost` are the same mint, the same `S`, and the same signatures.
+- **Only the mint picks a share's indices.** A wallet never names a share key
+  as a resulting note itself.
 
-The branch is derived from the host exactly as stored, port included, while a
-spend is bound to the bare hostname: `localhost:3338` derives one branch and
-signs for `localhost`.
-
-`derive_nostr_address_node(secret_key, host)` roots a branch in a Nostr
+`derive_nostr_service_root(secret_key, domain)` roots the same tree in a Nostr
 identity key for a holder with no BIP-39 words:
-`HMAC-SHA256(key = secret key, msg = "LNURLcash/nostr-seed")`, then the same
-path. That one is an extension, not LUD-25; a mint sees an ordinary `cx1`
-either way.
+`HMAC-SHA256(key = secret key, msg = "LNURLcash/nostr-seed")`, then LUD-26
+from that seed. That one is an extension, not LUD-26; a mint sees an ordinary
+`cx1` either way.
+
+### Notes from before LUD-26
+
+Until luds `a6c4652` a note key was a tweak of one branch node,
+`tagged_hash("LNURLcash/derive", P || chaincode || ser32(purpose) ||
+ser32(i))` (or without `ser32(purpose)` before luds `50d740a`), on
+`m/139'/d1/d2/d3/d4` over the host as stored, and a `cx1` was the 64-byte
+`x(P) || chaincode`. None of those keys is on the LUD-26 tree, so a wallet
+upgrading from 0.2 must scan them too and rotate what it finds into LUD-26
+keys: `legacy_branch_node`, `legacy_cx1_of`, `legacy_derive_note_pubkey` and
+`legacy_derive_note_secret_key` (`purpose` `None` for the pre-purpose scheme,
+or one of the `LEGACY_PURPOSE_*` constants) derive them. Nothing derives or
+registers new keys that way. A Lightning Address registered with an old `cx1`
+has to be registered again with a share's.
 
 ## Amounts
 
