@@ -124,10 +124,14 @@ fn nothing_else_has_a_note_id() {
 fn the_signed_message_names_the_key_for_a_ck1() {
     let a = part2_note(0x11);
     assert_eq!(
-        note_signature_message(&a.ck1, 21_000),
-        Some(format!("LNURLcash:21000:{}", a.pubkey))
+        note_signature_message(&a.ck1, "mint.example", 21_000),
+        Some(format!("LNURLcash:mint.example:21000:{}", a.pubkey))
     );
-    assert_eq!(note_signature_message("not a k1", 21_000), None);
+    assert_eq!(
+        note_signature_message("not a k1", "mint.example", 21_000),
+        None
+    );
+    assert_eq!(note_signature_message(&a.ck1, "", 21_000), None);
 }
 
 // ---- note URLs and lookups ----
@@ -195,7 +199,9 @@ fn part2_vectors() -> Value {
 #[test]
 fn an_echoed_ck1_must_be_the_same_valid_bearer() {
     let vectors = part2_vectors();
-    let notes = vectors["branches"][0]["notes"].as_array().expect("notes");
+    let notes = vectors["branches"][0]["accounts"][0]["wallet"]
+        .as_array()
+        .expect("wallet notes");
     let ours = notes[0]["ck1"].as_str().expect("ck1").to_string();
     let other = notes[1]["ck1"].as_str().expect("ck1").to_string();
 

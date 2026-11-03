@@ -1,4 +1,4 @@
-//! LUD-25's bech32m strings, key-path notes, and the seed branch they hang off.
+//! LUD-25's bech32m strings, key-path notes, and LUD-26's seed tree they hang off.
 //!
 //! Every note is a taproot output key `Q` (see [`crate::spend`]). A key-path
 //! note's `Q` is the holder's own key, used as is: the holder keeps `sk`,
@@ -16,7 +16,7 @@
 //! ck1<Q || sig>          a key-path spend, 96 bytes
 //! cw1<...>               a script-path spend, variable
 //! cs<amount>1<sig>       a mint's certificate, 65 bytes
-//! cx1<P || chain code>   a watch-only branch, 64 bytes
+//! cx1<chain code || P>   a share's xpub, 65 bytes
 //! ```
 //!
 //! The names and semantics follow the TypeScript kit, which follows
@@ -25,10 +25,13 @@
 use hmac::{Hmac, Mac};
 use k256::schnorr::{Signature as SchnorrSignature, SigningKey, VerifyingKey};
 use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-use secp256k1::{Keypair, Message, Scalar, SecretKey, XOnlyPublicKey};
+use secp256k1::{Keypair, Message, PublicKey, Scalar, SecretKey, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
-use crate::cash::{derive_cash_domain_node, derive_cash_root, CashNode};
+use crate::cash::{
+    cash_node_public_key, derive_cash_child, derive_cash_child_pub, derive_cash_domain_node,
+    derive_cash_root, derive_service_root, CashNode,
+};
 use crate::errors::{Error, Result};
 use crate::long_bech32::{self, Bech32m};
 use crate::secrets::is_preimage;
@@ -282,12 +285,17 @@ pub fn encode_cs1_with_amount(amount_msat: u64, signature: &[u8; 65]) -> String 
     )
 }
 
+/// `None` unless the payload is 65 bytes, `r || s || recovery-id`, with the
+/// recovery id 0 to 3, as LUD-25 has a SERVICE refuse anything else.
 pub fn decode_cs1_with_amount(value: &str) -> Option<Cs1> {
     let trimmed = value.trim();
     let separator = trimmed.rfind('1')?;
     let hrp = trimmed[..separator].to_ascii_lowercase();
     let amount_msat = decode_amount_suffix(hrp.strip_prefix("cs")?)?;
-    let signature = decode_fixed(&hrp, trimmed)?;
+    let signature: [u8; 65] = decode_fixed(&hrp, trimmed)?;
+    if signature[64] > 3 {
+        return None;
+    }
     Some(Cs1 {
         amount_msat,
         signature,
@@ -309,60 +317,262 @@ pub fn is_any_cs1(value: &str) -> bool {
     decode_any_cs1(value).is_some()
 }
 
-/// A watch-only branch export: the branch's x-only public key and its chain
-/// code. Whoever holds one can derive every note key on the branch, and link
-/// them all to each other, but can spend none of them.
+/// A share's extended public key (LUD-26): its chain code and compressed
+/// point, in BIP-32's order. Whoever holds one can derive every note key on
+/// the share with [`derive_note_pubkey`], and link them all to each other,
+/// but can spend none of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cx1 {
-    pub pubkey_x_only: [u8; 32],
     pub chain_code: [u8; 32],
+    /// Compressed, `02` or `03` first.
+    pub pubkey: [u8; 33],
 }
 
-pub fn encode_cx1(pubkey_x_only: &[u8; 32], chain_code: &[u8; 32]) -> String {
-    let mut bytes = [0u8; 64];
-    bytes[..32].copy_from_slice(pubkey_x_only);
-    bytes[32..].copy_from_slice(chain_code);
+impl Cx1 {
+    /// `x(P)`: what a registration proof by this share verifies against.
+    pub fn pubkey_x_only(&self) -> [u8; 32] {
+        let mut x = [0u8; 32];
+        x.copy_from_slice(&self.pubkey[1..]);
+        x
+    }
+}
+
+/// `bech32m("cx", chainCode || P)`, 113 characters.
+pub fn encode_cx1(cx1: &Cx1) -> String {
+    let mut bytes = [0u8; 65];
+    bytes[..32].copy_from_slice(&cx1.chain_code);
+    bytes[32..].copy_from_slice(&cx1.pubkey);
     encode_bytes("cx", &bytes)
 }
 
+/// `None` unless the payload is 65 bytes and its last 33 a compressed curve
+/// point. The superseded 64-byte shape is [`decode_legacy_cx1`]'s, and no
+/// SERVICE registers one any more.
 pub fn decode_cx1(value: &str) -> Option<Cx1> {
-    let bytes: [u8; 64] = decode_fixed("cx", value)?;
-    let mut pubkey_x_only = [0u8; 32];
+    let bytes: [u8; 65] = decode_fixed("cx", value)?;
     let mut chain_code = [0u8; 32];
-    pubkey_x_only.copy_from_slice(&bytes[..32]);
-    chain_code.copy_from_slice(&bytes[32..]);
-    Some(Cx1 {
-        pubkey_x_only,
-        chain_code,
-    })
+    let mut pubkey = [0u8; 33];
+    chain_code.copy_from_slice(&bytes[..32]);
+    pubkey.copy_from_slice(&bytes[32..]);
+    PublicKey::from_byte_array_compressed(pubkey).ok()?;
+    Some(Cx1 { chain_code, pubkey })
 }
 
 pub fn is_cx1(value: &str) -> bool {
     decode_cx1(value).is_some()
 }
 
-// ---- the per-note key tweak ----
+// ---- LUD-26: notes below a SERVICE's root ----
+//
+//   S            = m/139'/d1/d2/d3/d4      see crate::cash::derive_service_root
+//   S/a'/0/i     wallet: every note the wallet mints, rotates or merges into, and a split's p1
+//   S/a'/1/i     change: a split's p2
+//   S/a'/2/n'    share n, handed out as its cx1
+//   S/a'/2/n'/i  note i of share n, picked and credited by the SERVICE
+//
+// Plain BIP-32 all the way down: a note's secret key is the private key at
+// its path and its `Q` is `x(sk·G)`, so any BIP-32 library derives the same
+// tree, and a SERVICE holding a share's `cx1` derives that share's notes
+// with CKDpub alone. Accounts and shares are hardened, so no account's or
+// share's keys can be derived from another's; note indices are not, and are
+// below 2^31.
+
+/// Every note the wallet mints, rotates or merges into, and a split's `p1`.
+pub const CHAIN_WALLET: u32 = 0;
+/// A split's change `p2`.
+pub const CHAIN_CHANGE: u32 = 1;
+/// The shares, each exported as a `cx1`.
+pub const CHAIN_SHARE: u32 = 2;
+
+const HARDENED: u32 = 0x8000_0000;
+
+/// Where a note sits below a SERVICE's root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotePath {
+    /// `S/account'/0/index`
+    Wallet { account: u32, index: u32 },
+    /// `S/account'/1/index`
+    Change { account: u32, index: u32 },
+    /// `S/account'/2/share'/index`. Only a SERVICE picks these indices; a
+    /// wallet never names one as a resulting note itself.
+    Share {
+        account: u32,
+        share: u32,
+        index: u32,
+    },
+}
+
+fn below_hardened(value: u32, what: &str) -> Result<u32> {
+    if value >= HARDENED {
+        return Err(Error::Protocol(format!("{what} {value} is not below 2^31")));
+    }
+    Ok(value)
+}
+
+impl NotePath {
+    /// The BIP-32 indices below `S`, hardened ones included.
+    pub fn indices(&self) -> Result<Vec<u32>> {
+        let (account, middle, index) = match *self {
+            Self::Wallet { account, index } => (account, vec![CHAIN_WALLET], index),
+            Self::Change { account, index } => (account, vec![CHAIN_CHANGE], index),
+            Self::Share {
+                account,
+                share,
+                index,
+            } => (
+                account,
+                vec![CHAIN_SHARE, below_hardened(share, "a share")? + HARDENED],
+                index,
+            ),
+        };
+        let mut out = vec![below_hardened(account, "an account")? + HARDENED];
+        out.extend(middle);
+        out.push(below_hardened(index, "a note index")?);
+        Ok(out)
+    }
+}
+
+/// A note's keys. Bearer material: the secret key spends the note.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NoteKey {
+    pub secret_key: [u8; 32],
+    /// Compressed, so its `y` parity is visible: a BIP-340 signer negates
+    /// the secret key when it is odd.
+    pub pubkey: [u8; 33],
+    /// `Q = x(pubkey)`, the note itself.
+    pub output_key: [u8; 32],
+}
+
+impl std::fmt::Debug for NoteKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoteKey")
+            .field("secret_key", &"redacted")
+            .field("output_key", &hex::encode(self.output_key))
+            .finish()
+    }
+}
+
+impl Drop for NoteKey {
+    fn drop(&mut self) {
+        self.secret_key.fill(0);
+    }
+}
+
+/// The note at `path` below `service_root`
+/// ([`crate::cash::derive_service_root`]).
+pub fn derive_note_key(service_root: &CashNode, path: NotePath) -> Result<NoteKey> {
+    let mut node = service_root.clone();
+    for index in path.indices()? {
+        node = derive_cash_child(&node, index)?;
+    }
+    let pubkey = cash_node_public_key(&node)?;
+    let mut output_key = [0u8; 32];
+    output_key.copy_from_slice(&pubkey[1..]);
+    Ok(NoteKey {
+        secret_key: node.private_key,
+        pubkey,
+        output_key,
+    })
+}
+
+/// `S/account'/2/share'`, the node behind a share's `cx1`. Bearer material
+/// for every note on the share: hand out [`cash_node_to_cx1`] of it, and
+/// sign its registration with its own key ([`crate::sign_address_proof`]).
+pub fn derive_share_node(service_root: &CashNode, account: u32, share: u32) -> Result<CashNode> {
+    let mut node = derive_cash_child(
+        service_root,
+        below_hardened(account, "an account")? + HARDENED,
+    )?;
+    node = derive_cash_child(&node, CHAIN_SHARE)?;
+    derive_cash_child(&node, below_hardened(share, "a share")? + HARDENED)
+}
+
+/// A share node's `cx1`.
+pub fn cash_node_to_cx1(node: &CashNode) -> Result<Cx1> {
+    Ok(Cx1 {
+        chain_code: node.chain_code,
+        pubkey: cash_node_public_key(node)?,
+    })
+}
+
+/// `Q` of note `index` on the share `cx1` exports: CKDpub, no private key
+/// anywhere, which is what lets a SERVICE credit a registered share's next
+/// note. A hardened index is refused, and an unusable one (~2^-127) is an
+/// error: use the next.
+pub fn derive_note_pubkey(cx1: &Cx1, index: u32) -> Result<[u8; 32]> {
+    let (pubkey, _) = derive_cash_child_pub(&cx1.pubkey, &cx1.chain_code, index)?;
+    let mut output_key = [0u8; 32];
+    output_key.copy_from_slice(&pubkey[1..]);
+    Ok(output_key)
+}
+
+// ---- superseded: the per-note tweak ----
+//
+// Before LUD-26 (luds a6c4652), note keys were tweaked off one branch node,
+// m/139'/d1/d2/d3/d4 over the host as stored (port included), and a `cx1`
+// was the 64-byte `x(P) || chainCode`:
 //
 //   t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32(purpose) || ser32(i))
 //   pk_i = x(lift_x(P) + t*G)
 //   sk_i = ((P has even y ? p : n - p) + t) mod n
 //
-// BIP-341's taproot tweak, so a watcher holding only the `cx1` computes the
-// same `pk_i` the holder does, and libsecp256k1 already implements both
-// halves of it. `purpose` and `i` are any u32 and never hardened, each a
-// 4-byte big-endian word. `purpose` splits a branch into three independent
-// counters, so a wallet's own indices and a SERVICE's auto-minted ones can
-// never collide by coincidence.
+// purpose 0 was the wallet's own notes, 1 a split's change and 2 the
+// Lightning Address rail (luds 50d740a); before purposes (luds 6e865b1)
+// there was no ser32(purpose) at all. Notes minted under either are still
+// money, so a wallet derives them here to find and sweep them into LUD-26
+// keys. Nothing new is ever derived or registered this way.
 
-/// Purpose 0: every note the wallet itself mints, rotates into or merges
-/// into, and a split's resulting note `p1`. The registration proof and the
-/// address key are index 0 on this purpose.
-pub const PURPOSE_WALLET: u32 = 0;
-/// Purpose 1: a split's change note `p2`.
-pub const PURPOSE_CHANGE: u32 = 1;
-/// Purpose 2: a note credited by Lightning Address auto-mint or an internal
-/// transfer, whichever rail delivered it.
-pub const PURPOSE_LIGHTNING_ADDRESS: u32 = 2;
+/// Purpose 0 of the superseded tweak: the wallet's own notes.
+pub const LEGACY_PURPOSE_WALLET: u32 = 0;
+/// Purpose 1 of the superseded tweak: a split's change.
+pub const LEGACY_PURPOSE_CHANGE: u32 = 1;
+/// Purpose 2 of the superseded tweak: Lightning Address auto-mint and
+/// internal transfer.
+pub const LEGACY_PURPOSE_LIGHTNING_ADDRESS: u32 = 2;
+
+/// A superseded 64-byte `cx1`, `x(P) || chainCode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyCx1 {
+    pub pubkey_x_only: [u8; 32],
+    pub chain_code: [u8; 32],
+}
+
+pub fn encode_legacy_cx1(cx1: &LegacyCx1) -> String {
+    let mut bytes = [0u8; 64];
+    bytes[..32].copy_from_slice(&cx1.pubkey_x_only);
+    bytes[32..].copy_from_slice(&cx1.chain_code);
+    encode_bytes("cx", &bytes)
+}
+
+pub fn decode_legacy_cx1(value: &str) -> Option<LegacyCx1> {
+    let bytes: [u8; 64] = decode_fixed("cx", value)?;
+    let mut pubkey_x_only = [0u8; 32];
+    let mut chain_code = [0u8; 32];
+    pubkey_x_only.copy_from_slice(&bytes[..32]);
+    chain_code.copy_from_slice(&bytes[32..]);
+    Some(LegacyCx1 {
+        pubkey_x_only,
+        chain_code,
+    })
+}
+
+/// The node the superseded schemes tweaked their notes off: `m/139'/d1..d4`
+/// for `host` exactly as the wallet stored it, port included. Bearer
+/// material for every note it ever held there under them.
+pub fn legacy_branch_node(root: &CashNode, host: &str) -> Result<CashNode> {
+    derive_cash_domain_node(root, host)
+}
+
+/// The superseded watch-only half of a [`legacy_branch_node`].
+pub fn legacy_cx1_of(node: &CashNode) -> Result<LegacyCx1> {
+    let key = SecretKey::from_secret_bytes(node.private_key)
+        .map_err(|_| Error::Protocol("cash node holds an invalid private key".into()))?;
+    let (pubkey, _parity) = key.x_only_public_key();
+    Ok(LegacyCx1 {
+        pubkey_x_only: pubkey.to_byte_array(),
+        chain_code: node.chain_code,
+    })
+}
 
 const NOTE_DERIVE_TAG: &str = "LNURLcash/derive";
 
@@ -372,25 +582,25 @@ fn unusable(index: u32) -> Error {
     ))
 }
 
+// `purpose` None is the pre-purpose scheme.
 fn tweak_for(
     pubkey_x_only: &[u8; 32],
     chain_code: &[u8; 32],
-    purpose: u32,
+    purpose: Option<u32>,
     index: u32,
 ) -> Result<Scalar> {
-    let t = tagged_hash(
-        NOTE_DERIVE_TAG,
-        &[
-            pubkey_x_only,
-            chain_code,
-            &purpose.to_be_bytes(),
-            &index.to_be_bytes(),
-        ],
-    );
+    let purpose = purpose.map(u32::to_be_bytes);
+    let index_bytes = index.to_be_bytes();
+    let mut parts: Vec<&[u8]> = vec![pubkey_x_only, chain_code];
+    if let Some(purpose) = &purpose {
+        parts.push(purpose);
+    }
+    parts.push(&index_bytes);
+    let t = tagged_hash(NOTE_DERIVE_TAG, &parts);
     Scalar::from_be_bytes(reduce_mod_n(t)).map_err(|_| unusable(index))
 }
 
-// t mod n, as the spec requires and lnurl-wallet does (lnurl-mint refuses
+// t mod n, as the spec required and lnurl-wallet did (lnurl-mint refused
 // t >= n instead; at ~2^-128 the two never meet). libsecp256k1 only takes a
 // tweak already below n, so k256 reduces it first.
 fn reduce_mod_n(t: [u8; 32]) -> [u8; 32] {
@@ -400,41 +610,36 @@ fn reduce_mod_n(t: [u8; 32]) -> [u8; 32] {
         .into()
 }
 
-/// A note's public key at `purpose` and `index`, from the `cx1` half of a branch alone.
-///
-/// Watch-only: no private key anywhere, which is what lets a SERVICE holding a
-/// registered `cx1` mint straight to the holder's next key.
-pub fn derive_note_pubkey(
-    branch_pubkey_x_only: &[u8; 32],
-    chain_code: &[u8; 32],
-    purpose: u32,
+/// A note key under the superseded tweak, from the legacy `cx1` half alone.
+/// `purpose` is `None` for the scheme before purposes existed.
+pub fn legacy_derive_note_pubkey(
+    cx1: &LegacyCx1,
+    purpose: Option<u32>,
     index: u32,
 ) -> Result<[u8; 32]> {
-    let branch = XOnlyPublicKey::from_byte_array(*branch_pubkey_x_only)
+    let branch = XOnlyPublicKey::from_byte_array(cx1.pubkey_x_only)
         .map_err(|_| Error::Protocol("a branch key is not an x-only secp256k1 point".into()))?;
-    let tweak = tweak_for(branch_pubkey_x_only, chain_code, purpose, index)?;
+    let tweak = tweak_for(&cx1.pubkey_x_only, &cx1.chain_code, purpose, index)?;
     // lift_x(P) + t*G, refusing the point at infinity
     let (note, _parity) = branch.add_tweak(&tweak).map_err(|_| unusable(index))?;
     Ok(note.to_byte_array())
 }
 
-/// The holder's half: the secret key behind [`derive_note_pubkey`].
-///
-/// The branch key's own point may have odd y, and a `cx1` only carries x,
-/// which names the even-y point, so the key is negated first or its note keys
-/// would not match what a watcher derives. libsecp256k1's x-only keypair tweak
-/// does exactly that, and refuses a zero result.
-pub fn derive_note_secret_key(
-    branch_private_key: &[u8; 32],
-    chain_code: &[u8; 32],
-    purpose: u32,
+/// The secret key behind [`legacy_derive_note_pubkey`], from a
+/// [`legacy_branch_node`]. The branch key's own point may have odd y, and a
+/// legacy `cx1` only carried x, which names the even-y point, so the key is
+/// negated first; libsecp256k1's x-only keypair tweak does exactly that, and
+/// refuses a zero result.
+pub fn legacy_derive_note_secret_key(
+    node: &CashNode,
+    purpose: Option<u32>,
     index: u32,
 ) -> Result<[u8; 32]> {
-    let branch = Keypair::from_secret_bytes(*branch_private_key).map_err(|_| {
+    let branch = Keypair::from_secret_bytes(node.private_key).map_err(|_| {
         Error::Protocol("a branch private key is a 32-byte scalar in [1, n)".into())
     })?;
     let (branch_x, _parity) = branch.x_only_public_key();
-    let tweak = tweak_for(&branch_x.to_byte_array(), chain_code, purpose, index)?;
+    let tweak = tweak_for(&branch_x.to_byte_array(), &node.chain_code, purpose, index)?;
     let note = branch
         .add_xonly_tweak(&tweak)
         .map_err(|_| unusable(index))?;
@@ -583,65 +788,36 @@ pub fn note_lookup_of(k1: &str) -> Option<String> {
     decode_spend(value).map(|spend| encode_cp1(&spend.output_key()))
 }
 
-// ---- the address branch ----
-
-/// `m/139'/d1/d2/d3/d4` for one mint - the literal path this section's text
-/// specifies, and the exact node [`derive_cash_domain_node`] already derives
-/// for any `SERVICE`. There is no separate purpose for key-path notes: an
-/// earlier reference-wallet extension deterministically derived bearer
-/// secrets off this same root too, under a `1'` sub-purpose kept just for
-/// this branch to avoid colliding with it; that extension is gone (see
-/// [`crate::cash`]), so there is nothing left to collide with.
-///
-/// Bearer material for every note on the branch. Hand out
-/// [`cash_node_to_cx1`] of it, never the node.
-pub fn derive_cash_address_node(root: &CashNode, host: &str) -> Result<CashNode> {
-    derive_cash_domain_node(root, host)
-}
-
-/// The watch-only half of a branch node.
-pub fn cash_node_to_cx1(node: &CashNode) -> Result<Cx1> {
-    let key = SecretKey::from_secret_bytes(node.private_key)
-        .map_err(|_| Error::Protocol("cash node holds an invalid private key".into()))?;
-    let (pubkey, _parity) = key.x_only_public_key();
-    Ok(Cx1 {
-        pubkey_x_only: pubkey.to_byte_array(),
-        chain_code: node.chain_code,
-    })
-}
-
-// ---- a branch rooted in a Nostr key ----
+// ---- a tree rooted in a Nostr key ----
 //
-// An extension, not LUD-25. A lightning address on a Nostr-native mint
+// An extension, not LUD-25/26. A lightning address on a Nostr-native mint
 // belongs to an npub, and a holder with no BIP-39 words (a hardware signer
 // that keeps only its identity key, or a wallet that never made any) can
 // still be paid to keys of its own:
 //
 //   seed = HMAC-SHA256(key = the identity's secret key, msg = "LNURLcash/nostr-seed")
 //
-// then the address path above from that seed, unchanged. The TypeScript kit
-// derives the same branch, and so does at least one hardware signer. The
-// identity key rebuilds every note paid to the branch, so whoever can restore
-// that key can recover the notes, with or without the device that received
-// them. A mint sees an ordinary `cx1` either way.
+// then LUD-26's tree from that seed, unchanged. The identity key rebuilds
+// every note on it, so whoever can restore that key can recover the notes,
+// with or without the device that received them. A mint sees an ordinary
+// `cx1` either way.
 
 pub const NOSTR_CASH_SEED_LABEL: &str = "LNURLcash/nostr-seed";
 
-/// Bearer material: the seed every note on the identity's branches grows
-/// from.
+/// Bearer material: the seed every note on the identity's tree grows from.
 pub fn derive_nostr_cash_seed(secret_key: &[u8; 32]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(secret_key).expect("HMAC takes a key of any length");
     mac.update(NOSTR_CASH_SEED_LABEL.as_bytes());
     mac.finalize().into_bytes().into()
 }
 
-/// One mint's address branch for a Nostr identity. Bearer material, like any
-/// address node: hand out [`cash_node_to_cx1`] of it.
-pub fn derive_nostr_address_node(secret_key: &[u8; 32], host: &str) -> Result<CashNode> {
+/// One mint's LUD-26 root `S` for a Nostr identity. Bearer material, like
+/// any SERVICE root: hand out a share's `cx1`.
+pub fn derive_nostr_service_root(secret_key: &[u8; 32], domain: &str) -> Result<CashNode> {
     let mut seed = derive_nostr_cash_seed(secret_key);
     let root = derive_cash_root(&seed);
     seed.fill(0);
-    derive_cash_address_node(&root?, host)
+    derive_service_root(&root?, domain)
 }
 
 #[cfg(test)]
@@ -676,8 +852,21 @@ mod tests {
                 "cw",
                 encode_cw1(&bearer_cw1(&[0x44; 32]).expect("a cw1")).expect("encodes"),
             ),
-            ("cs", encode_cs1_with_amount(21_000, &[0x33; 65])),
-            ("cx", encode_cx1(&pubkey, &[0x22; 32])),
+            ("cs", {
+                let mut signature = [0x33; 65];
+                signature[64] = 1;
+                encode_cs1_with_amount(21_000, &signature)
+            }),
+            (
+                "cx",
+                encode_cx1(&Cx1 {
+                    chain_code: [0x22; 32],
+                    pubkey: PublicKey::from_secret_key(
+                        &SecretKey::from_secret_bytes([0x11; 32]).expect("a key"),
+                    )
+                    .serialize(),
+                }),
+            ),
         ]
     }
 
@@ -724,10 +913,10 @@ mod tests {
     #[test]
     fn non_zero_padding_is_refused() {
         // Every payload here leaves spare bits in the last five-bit group,
-        // which must be zero, except 65-byte cs1, which fills its groups
-        // exactly.
+        // which must be zero, except the 65-byte cs1 and cx1, which fill
+        // their groups exactly.
         for (hrp, value) in samples() {
-            if hrp == "cs" {
+            if hrp == "cs" || hrp == "cx" {
                 continue;
             }
             let (prefix, mut words) = words_of(&value);
@@ -925,49 +1114,154 @@ mod tests {
     fn signing_refuses_a_key_outside_the_curve_order() {
         assert!(sign_note_ownership(&[0; 32], DOMAIN).is_err());
         assert!(sign_note_ownership(&[0xff; 32], DOMAIN).is_err());
-        assert!(derive_note_secret_key(&[0; 32], &[0; 32], 0, 0).is_err());
+        let zero = CashNode {
+            private_key: [0; 32],
+            chain_code: [0; 32],
+        };
+        assert!(derive_note_key(
+            &zero,
+            NotePath::Wallet {
+                account: 0,
+                index: 0
+            }
+        )
+        .is_err());
+        assert!(legacy_derive_note_secret_key(&zero, Some(0), 0).is_err());
         // above the field prime, so not an x coordinate at all
-        assert!(derive_note_pubkey(&[0xff; 32], &[0; 32], 0, 0).is_err());
+        let off_curve = LegacyCx1 {
+            pubkey_x_only: [0xff; 32],
+            chain_code: [0; 32],
+        };
+        assert!(legacy_derive_note_pubkey(&off_curve, Some(0), 0).is_err());
     }
 
     #[test]
-    fn the_address_branch_is_the_domain_node_itself() {
-        let root = derive_cash_root(&SEED).expect("root");
-        let address = derive_cash_address_node(&root, "mint.example").expect("address node");
-        let domain = derive_cash_domain_node(&root, "mint.example").expect("domain node");
-        assert_eq!(cash_node_to_hex(&address), cash_node_to_hex(&domain));
+    fn a_cx1_is_refused_unless_its_key_is_a_compressed_point() {
+        let mut bytes = [0u8; 65];
+        bytes[32] = 0x02;
+        bytes[33..].fill(0xff);
+        assert_eq!(decode_cx1(&encode_bytes("cx", &bytes)), None);
+        bytes[32] = 0x04;
+        assert_eq!(decode_cx1(&encode_bytes("cx", &bytes)), None);
+        // the superseded 64-byte shape is not a cx1, only a legacy one
+        let legacy = encode_legacy_cx1(&LegacyCx1 {
+            pubkey_x_only: [0x22; 32],
+            chain_code: [0x33; 32],
+        });
+        assert_eq!(decode_cx1(&legacy), None);
+        assert!(decode_legacy_cx1(&legacy).is_some());
     }
 
     #[test]
-    fn a_watcher_and_the_holder_agree_on_every_note_key() {
+    fn the_service_root_hashes_the_domain_without_its_port() {
         let root = derive_cash_root(&SEED).expect("root");
-        let node = derive_cash_address_node(&root, "mint.example").expect("address node");
-        let cx1 = cash_node_to_cx1(&node).expect("cx1");
-        for index in [0, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
-            let pubkey =
-                derive_note_pubkey(&cx1.pubkey_x_only, &cx1.chain_code, PURPOSE_WALLET, index)
-                    .expect("pubkey");
-            let secret =
-                derive_note_secret_key(&node.private_key, &node.chain_code, PURPOSE_WALLET, index)
-                    .expect("sk");
-            let signature = sign_note_ownership(&secret, DOMAIN).expect("signs");
+        let service = derive_service_root(&root, "https://MINT.example:3338/w").expect("root S");
+        let bare = derive_cash_domain_node(&root, "mint.example").expect("domain node");
+        let as_stored = derive_cash_domain_node(&root, "mint.example:3338").expect("legacy node");
+        assert_eq!(cash_node_to_hex(&service), cash_node_to_hex(&bare));
+        assert_ne!(cash_node_to_hex(&service), cash_node_to_hex(&as_stored));
+    }
+
+    #[test]
+    fn a_watcher_and_the_holder_agree_on_every_share_note() {
+        let root = derive_cash_root(&SEED).expect("root");
+        let service = derive_service_root(&root, DOMAIN).expect("root S");
+        let cx1 =
+            cash_node_to_cx1(&derive_share_node(&service, 0, 0).expect("share")).expect("cx1");
+        for index in [0, 1, 0x7fff_ffff] {
+            let pubkey = derive_note_pubkey(&cx1, index).expect("pubkey");
+            let key = derive_note_key(
+                &service,
+                NotePath::Share {
+                    account: 0,
+                    share: 0,
+                    index,
+                },
+            )
+            .expect("note key");
+            assert_eq!(key.output_key, pubkey, "{index}");
+            let signature = sign_note_ownership(&key.secret_key, DOMAIN).expect("signs");
             assert_eq!(
                 recover_note_ownership_pubkey(&signature, DOMAIN).map(|owner| owner.pubkey_x_only),
                 Some(pubkey),
                 "{index}"
             );
         }
+        assert!(derive_note_pubkey(&cx1, 0x8000_0000).is_err());
     }
 
     #[test]
-    fn a_nostr_branch_is_the_address_path_from_its_seed() {
+    fn chains_accounts_and_shares_never_share_a_key() {
+        let root = derive_cash_root(&SEED).expect("root");
+        let service = derive_service_root(&root, DOMAIN).expect("root S");
+        let keys: Vec<[u8; 32]> = [
+            NotePath::Wallet {
+                account: 0,
+                index: 0,
+            },
+            NotePath::Change {
+                account: 0,
+                index: 0,
+            },
+            NotePath::Wallet {
+                account: 1,
+                index: 0,
+            },
+            NotePath::Share {
+                account: 0,
+                share: 0,
+                index: 0,
+            },
+            NotePath::Share {
+                account: 0,
+                share: 1,
+                index: 0,
+            },
+        ]
+        .into_iter()
+        .map(|path| derive_note_key(&service, path).expect("key").output_key)
+        .collect();
+        for (i, a) in keys.iter().enumerate() {
+            assert!(keys[i + 1..].iter().all(|b| a != b), "{i}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_watcher_and_holder_agree_on_every_note_key() {
+        let root = derive_cash_root(&SEED).expect("root");
+        let node = legacy_branch_node(&root, "mint.example").expect("legacy node");
+        let cx1 = legacy_cx1_of(&node).expect("legacy cx1");
+        for purpose in [
+            None,
+            Some(LEGACY_PURPOSE_WALLET),
+            Some(LEGACY_PURPOSE_LIGHTNING_ADDRESS),
+        ] {
+            for index in [0, 1, 0x8000_0000, u32::MAX] {
+                let pubkey = legacy_derive_note_pubkey(&cx1, purpose, index).expect("pubkey");
+                let secret = legacy_derive_note_secret_key(&node, purpose, index).expect("secret");
+                let signature = sign_note_ownership(&secret, DOMAIN).expect("signs");
+                assert_eq!(
+                    recover_note_ownership_pubkey(&signature, DOMAIN)
+                        .map(|owner| owner.pubkey_x_only),
+                    Some(pubkey),
+                    "{purpose:?}/{index}"
+                );
+            }
+        }
+        assert_ne!(
+            legacy_derive_note_pubkey(&cx1, None, 0).expect("pre-purpose"),
+            legacy_derive_note_pubkey(&cx1, Some(LEGACY_PURPOSE_WALLET), 0).expect("purpose 0")
+        );
+    }
+
+    #[test]
+    fn a_nostr_tree_is_lud26_from_its_seed() {
         let identity = [0x07; 32];
         let seed = derive_nostr_cash_seed(&identity);
-        let expected =
-            derive_cash_address_node(&derive_cash_root(&seed).expect("root"), "moneyer.dev")
-                .expect("address node");
-        let node = derive_nostr_address_node(&identity, "moneyer.dev").expect("nostr node");
-        assert_eq!(cash_node_to_hex(&node), cash_node_to_hex(&expected));
+        let expected = derive_service_root(&derive_cash_root(&seed).expect("root"), "moneyer.dev")
+            .expect("service root");
+        let root = derive_nostr_service_root(&identity, "moneyer.dev").expect("nostr root");
+        assert_eq!(cash_node_to_hex(&root), cash_node_to_hex(&expected));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::fees::{parse_mint_fee, MintFee};
 use crate::note::note_k1;
 use crate::recoverable::{is_cp1, note_id_of};
 use crate::secrets::{hash_k1, is_preimage};
-use crate::spend::{check_spend, decode_note, spend_domain_of, SpendVerdict};
+use crate::spend::{check_spend, decode_note, decode_spend, spend_domain_of, SpendVerdict};
 use crate::urls::is_allowed_service_url;
 
 /// What this crate insists a SERVICE does, rather than merely hopes it does.
@@ -549,6 +549,67 @@ pub fn melt_request(callback: &str, k1: &str, pr: &str) -> Result<Request> {
     )?))
 }
 
+/// LUD-26's internal transfer: pay a Lightning Address at the note's own
+/// mint with the note itself, by sending its spend to the address's
+/// payRequest `callback` instead of asking for an invoice. The SERVICE burns
+/// the note and credits its full value, free of fees, to the payee's next
+/// share key, which the payer never learns.
+///
+/// `amount_msat` MUST be the note's full value (`maxWithdrawable` from its
+/// informational GET), within the payRequest's sendable range: to pay part of
+/// a note, split off the exact amount first.
+///
+/// Refused, before anything is sent, unless the payRequest's `withdrawLink`
+/// is on `note_domain` (the note URL, or the mint it lives at). Anywhere else
+/// this hands a bearer secret to a SERVICE that does not hold the note.
+pub fn internal_transfer_request(
+    pay_request: &PayRequestInfo,
+    note_domain: &str,
+    k1: &str,
+    amount_msat: u64,
+) -> Result<Request> {
+    let same_mint = pay_request
+        .withdraw_link
+        .as_deref()
+        .and_then(spend_domain_of)
+        .zip(spend_domain_of(note_domain))
+        .is_some_and(|(payee, note)| payee == note);
+    if !same_mint {
+        return Err(Error::RequestRefused(
+            "that Lightning Address is not at the note's mint, so the note cannot be sent to it - pay it over Lightning instead".into(),
+        ));
+    }
+    if amount_msat < pay_request.min_sendable || amount_msat > pay_request.max_sendable {
+        return Err(Error::RequestRefused(format!(
+            "{amount_msat} msat is outside what that address accepts - split the note first"
+        )));
+    }
+    if decode_spend(k1).is_none() {
+        return Err(Error::RequestRefused("that k1 is no spend".into()));
+    }
+    Ok(Request::plain(callback_url(
+        &pay_request.callback,
+        &[
+            ("amount", amount_msat.to_string()),
+            ("k1", k1.trim().to_string()),
+        ],
+    )?))
+}
+
+/// The answer to an [`internal_transfer_request`]. Anything but a clear
+/// `OK` or a clear refusal is ambiguous: the note may already be burned.
+pub fn parse_internal_transfer(body: &Value) -> Result<()> {
+    if let Err(Error::ServiceRejected(reason)) = reject_error(body) {
+        return Err(classify_note_error(&reason));
+    }
+    if body.get("status").and_then(|v| v.as_str()) != Some("OK") {
+        return Err(Error::ambiguous(
+            "the service did not confirm the transfer - the note may already be spent",
+        ));
+    }
+    Ok(())
+}
+
 // ---- the output-naming variants ----
 //
 // The mutation behind rotate, split and merge, taking an output the caller
@@ -935,6 +996,71 @@ pub fn parse_verify(body: &Value) -> Result<VerifyResult> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const PREIMAGE: &str = "0001020304050607080910111213141516171819202122232425262728293031";
+
+    fn payee(withdraw_link: Option<&str>) -> PayRequestInfo {
+        PayRequestInfo {
+            callback: "https://mint.example/.well-known/lnurlp/bob/cb".into(),
+            min_sendable: 1000,
+            max_sendable: 100_000_000,
+            metadata: "[]".into(),
+            withdraw_link: withdraw_link.map(str::to_string),
+            mint_pubkey: None,
+            mint_fee: None,
+            comment_allowed: None,
+            mint_to_hash: false,
+        }
+    }
+
+    #[test]
+    fn an_internal_transfer_sends_the_whole_note_to_the_callback() {
+        for link in ["https://mint.example/w", "lnurlw://MINT.example/w"] {
+            let request = internal_transfer_request(
+                &payee(Some(link)),
+                "https://mint.example:443/w?k1=x",
+                PREIMAGE,
+                21_000,
+            )
+            .expect("same mint");
+            assert_eq!(
+                request.url,
+                format!(
+                    "https://mint.example/.well-known/lnurlp/bob/cb?amount=21000&k1={PREIMAGE}"
+                ),
+                "{link}"
+            );
+            assert!(request.new_secrets.is_empty() && request.outputs.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_internal_transfer_never_leaves_the_notes_mint() {
+        // no withdrawLink, or one at another mint: the spend would go to a
+        // SERVICE that does not hold the note
+        for payee in [payee(None), payee(Some("https://other.example/w"))] {
+            assert!(matches!(
+                internal_transfer_request(&payee, "mint.example", PREIMAGE, 21_000),
+                Err(Error::RequestRefused(_))
+            ));
+        }
+        let payee = payee(Some("https://mint.example/w"));
+        for amount in [999, 100_000_001] {
+            assert!(internal_transfer_request(&payee, "mint.example", PREIMAGE, amount).is_err());
+        }
+        assert!(internal_transfer_request(&payee, "mint.example", "not a spend", 21_000).is_err());
+    }
+
+    #[test]
+    fn an_internal_transfer_answer_is_ok_refused_or_ambiguous() {
+        assert!(parse_internal_transfer(&json!({"status": "OK"})).is_ok());
+        let refused =
+            parse_internal_transfer(&json!({"status": "ERROR", "reason": "already in use"}))
+                .unwrap_err();
+        assert!(refused.is_definitive(), "{refused:?}");
+        let unclear = parse_internal_transfer(&json!({"tag": "payRequest"})).unwrap_err();
+        assert!(unclear.is_ambiguous(), "{unclear:?}");
+    }
 
     fn address(extra: Value) -> Value {
         let mut body = json!({

@@ -282,8 +282,12 @@ async fn rotate_burns_the_old_secret_and_mints_one_the_service_never_saw() {
     ));
 }
 
+/// A mint from before luds 92abbb3 that forwarded its node's signmessage
+/// output unreordered: `recovery_id || r || s`, over the message without a
+/// domain. Notes people hold carry such certificates, so they still verify,
+/// as legacy; a current certificate is only ever `r || s || recovery_id`.
 #[tokio::test]
-async fn accepts_the_other_recovery_id_layout() {
+async fn accepts_the_other_recovery_id_layout_as_legacy() {
     let mint = mint_or_skip!(&["--signatureLayout=leading"]);
     let client = Client::new();
     let k1 = secret(7);
@@ -291,6 +295,9 @@ async fn accepts_the_other_recovery_id_layout() {
 
     let rotated = client.rotate_note(&mint.callback(), &k1).await.unwrap();
     let signature = rotated.signature.expect("mint signs");
+    let check = check_note(&rotated.k1, &mint.url, 21000, &signature, &mint.pubkey)
+        .expect("an older certificate is still a certificate");
+    assert_eq!(check.certificate, CertifiedOver::LegacyOutputKey);
     assert!(verify_note_signature(
         &rotated.k1,
         &mint.url,
@@ -1237,7 +1244,7 @@ async fn looks_a_note_up_by_p_without_its_spend() {
         assert_eq!(info.max_withdrawable, 21000);
         let sig = info.signature.expect("certified");
         assert_eq!(
-            check_note_certificate(&reference, 21000, &sig, &mint.pubkey),
+            check_note_certificate(&reference, &mint.url, 21000, &sig, &mint.pubkey),
             Some(CertifiedOver::OutputKey),
             "{reference}"
         );

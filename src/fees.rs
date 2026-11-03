@@ -1,10 +1,13 @@
-//! LUD-25 mint fees (optional).
+//! LUD-25 mint fees (optional), and LUD-26's address fee.
 //!
-//! A SERVICE signals what it withholds on minting via an extra
-//! `["text/plain", "Mint fees: <base_fee_msat>,<fee_percent_ppm>"]` entry in a
-//! payRequest's metadata, so a WALLET can warn the payer up front that the note
-//! they end up holding is worth less than the invoice they paid. A SERVICE that
-//! omits the entry is fee-free, not unknown.
+//! A SERVICE signals what it withholds on minting with a
+//! `Mint fees: <base_fee_msat>,<fee_ppm>` token anywhere in its payRequest's
+//! `text/plain` metadata entry, so a WALLET can warn the payer up front that
+//! the note they end up holding is worth less than the invoice they paid. The
+//! values are plain base-10 integers separated by commas, ending at
+//! whitespace or the end of the entry. A third value is LUD-26's address fee,
+//! what registering one Lightning Address costs. A SERVICE without the token
+//! is fee-free, not unknown.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,56 +15,68 @@ use serde::{Deserialize, Serialize};
 pub struct MintFee {
     pub base_fee_msat: u64,
     pub fee_ppm: u64,
+    /// LUD-26's third value: the fee per Lightning Address registration.
+    /// `None` when it is not advertised, or does not parse; either way a
+    /// WALLET should refuse to pay a registration invoice it was not told
+    /// about.
+    #[serde(default)]
+    pub address_fee_msat: Option<u64>,
 }
 
+const TOKEN: &str = "Mint fees:";
+
+// Above 2^53 most languages lose integer precision, and a fee read wrong is
+// worse than no fee: refuse it rather than estimate with a mangled value.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+fn value_of(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u64>()
+        .ok()
+        .filter(|value| *value <= MAX_SAFE_INTEGER)
+}
+
+// The token's values: after "Mint fees:" and any spaces, up to the next
+// whitespace. `None` when the first two do not parse, which LUD-25 calls an
+// unknown fee: a WALLET relies on maxWithdrawable alone.
+fn parse_token(text: &str) -> Option<MintFee> {
+    let at = text.find(TOKEN)?;
+    let rest = text[at + TOKEN.len()..].trim_start();
+    let values = rest.split(char::is_whitespace).next().unwrap_or_default();
+    let mut parts = values.split(',');
+    let base_fee_msat = value_of(parts.next()?)?;
+    let fee_ppm = value_of(parts.next()?)?;
+    // A fee of 100% or more can never net anything. Refusing it here is also
+    // what keeps gross_up_for_mint_fee's search bounded, so a SERVICE cannot
+    // stall a caller simply by advertising one.
+    if fee_ppm >= 1_000_000 {
+        return None;
+    }
+    let address_fee_msat = parts.next().and_then(value_of);
+    Some(MintFee {
+        base_fee_msat,
+        fee_ppm,
+        address_fee_msat,
+    })
+}
+
+/// The first parseable `Mint fees` token in a payRequest's `text/plain`
+/// entries. `None` when there is none, which is fee-free, when it does not
+/// parse, which is a fee the WALLET does not know, and when every value is
+/// zero, so a caller never has to special-case a fee that withholds nothing.
 pub fn parse_mint_fee(metadata: &str) -> Option<MintFee> {
     let entries: Vec<Vec<serde_json::Value>> = serde_json::from_str(metadata).ok()?;
-    for entry in entries {
-        let Some(kind) = entry.first().and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if kind != "text/plain" {
-            continue;
-        }
-        let Some(text) = entry.get(1).and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(rest) = text.strip_prefix("Mint fees:") else {
-            continue;
-        };
-        let mut parts = rest.split(',');
-        let (Some(base), Some(ppm), None) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let (base, ppm) = (base.trim(), ppm.trim());
-        if base.is_empty()
-            || ppm.is_empty()
-            || !base.bytes().all(|b| b.is_ascii_digit())
-            || !ppm.bytes().all(|b| b.is_ascii_digit())
-        {
-            continue;
-        }
-        let (Ok(base_fee_msat), Ok(fee_ppm)) = (base.parse::<u64>(), ppm.parse::<u64>()) else {
-            continue;
-        };
-        // A fee of 100% or more can never net anything. Refusing it here is also
-        // what keeps gross_up_for_mint_fee's search bounded, so a SERVICE cannot
-        // stall a caller simply by advertising one.
-        if fee_ppm >= 1_000_000 {
-            continue;
-        }
-        // An explicit "Mint fees: 0,0" has exactly the effect of omitting the
-        // entry - treat it identically, so callers never have to special-case a
-        // fee that is present but withholds nothing.
-        if base_fee_msat == 0 && fee_ppm == 0 {
-            return None;
-        }
-        return Some(MintFee {
-            base_fee_msat,
-            fee_ppm,
-        });
+    let fee = entries
+        .iter()
+        .filter(|entry| entry.first().and_then(|v| v.as_str()) == Some("text/plain"))
+        .filter_map(|entry| entry.get(1).and_then(|v| v.as_str()))
+        .find_map(parse_token)?;
+    if fee.base_fee_msat == 0 && fee.fee_ppm == 0 && fee.address_fee_msat.unwrap_or(0) == 0 {
+        return None;
     }
-    None
+    Some(fee)
 }
 
 /// `floor(gross * ppm / 1_000_000)`, computed so it cannot overflow.
