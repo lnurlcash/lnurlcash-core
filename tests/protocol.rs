@@ -1274,8 +1274,16 @@ async fn an_output_already_in_use_is_refused_and_nothing_burns() {
             Policy::default(),
         )
         .unwrap_err();
-        assert!(err.is_output_in_use(), "{output}: {err:?}");
+        // LUD-25 answers a taken output and a burned input alike, "already
+        // in use", read as spent so fresh secrets stay attached; a caller
+        // that named its own output tells them apart by its inputs
+        assert!(err.is_already_in_use(), "{output}: {err:?}");
         assert!(err.is_definitive(), "{output}");
+        let info = Client::new()
+            .fetch_note_info(&mint.note_url(&k1))
+            .await
+            .expect("the input is outstanding, so the output was the taken one");
+        assert_eq!(info.max_withdrawable, 21000);
     }
     assert_eq!(mint.note_state(&k1).await.as_deref(), Some("outstanding"));
 }
