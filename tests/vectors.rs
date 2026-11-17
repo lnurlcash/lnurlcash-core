@@ -36,13 +36,12 @@ use lnurlcash_core::{
     address_proof_digest, address_proof_message, apply_mint_fee, build_note_url, check_note,
     check_note_certificate, check_note_url, decode_bolt11_amount_msat, format_fee_percent,
     from_bech32_lnurl, gross_up_for_mint_fee, is_allowed_service_url, is_bolt11_invoice,
-    is_preimage, legacy_note_signature_digest_for_hash, legacy_note_signature_message_for_hash,
-    lightning_address_username, mint_address_url, note_declared_amount, note_id_of, note_k1,
-    note_lookup_of, note_signature, note_signature_digest, note_signature_digest_for_hash,
+    is_preimage, lightning_address_username, mint_address_url, note_declared_amount, note_id_of,
+    note_k1, note_lookup_of, note_signature, note_signature_digest, note_signature_digest_for_hash,
     note_signature_message, note_signature_message_for_hash, parse_mint_fee, resolve_lnurl_input,
     resolve_mint_input, resolve_note_input, same_invoice, sign_address_proof, to_bech32_lnurl,
-    verify_address_proof, verify_legacy_note_signature_hash, verify_note_signature,
-    verify_note_signature_hash, with_new_k1, without_k1, CertifiedOver, MintFee,
+    verify_address_proof, verify_note_signature, verify_note_signature_hash, with_new_k1,
+    without_k1, MintFee,
 };
 use lnurlcash_core::{hash_k1, Error};
 use secp256k1::ecdsa::RecoverableSignature;
@@ -81,74 +80,6 @@ fn fee_of(value: &Value) -> MintFee {
         fee_ppm: value["feePpm"].as_u64().expect("feePpm"),
         // absent from the apply and grossUp cases, which do not use it
         address_fee_msat: value["addressFeeMsat"].as_u64(),
-    }
-}
-
-/// signature.json predates notes keyed by `Q`: every certificate there is
-/// over a bearer note's hash `h`, with no domain, the message a mint signed
-/// before LUD-25 moved certificates onto `hex(Q)` at the mint's domain. The
-/// verdicts still hold through the legacy reading, reported as such; the
-/// message a current mint signs for the same note is over its domain and `Q`
-/// instead.
-#[test]
-fn signature_vectors() {
-    let vectors = load("signature.json");
-    let cases = vectors["cases"].as_array().expect("cases");
-    assert!(cases.len() > 5, "too few signature cases to be meaningful");
-
-    for case in cases {
-        let name = str_of(case, "name");
-        let k1 = str_of(case, "k1");
-        let amount = case["amountMsat"].as_u64().expect("amountMsat");
-        let signature = str_of(case, "signature");
-        let pubkey = str_of(case, "mintPubkey");
-        let expected = case["valid"].as_bool().expect("valid");
-
-        // a bearer preimage opens its note anywhere, so the domain is moot
-        assert_eq!(
-            verify_note_signature(&k1, "mint.example", amount, &signature, &pubkey),
-            expected,
-            "{name}"
-        );
-        if expected {
-            let check = check_note(&k1, "mint.example", amount, &signature, &pubkey)
-                .unwrap_or_else(|| panic!("{name}: a valid certificate"));
-            assert_eq!(check.certificate, CertifiedOver::LegacyHash, "{name}");
-            let h = str_of(case, "noteId");
-            assert_eq!(
-                check_note_certificate(&h, "mint.example", amount, &signature, &pubkey),
-                Some(CertifiedOver::LegacyHash),
-                "{name}: by h"
-            );
-        }
-
-        if let Some(message) = case["message"].as_str() {
-            let h = str_of(case, "noteId");
-            assert_eq!(
-                legacy_note_signature_message_for_hash(&h, amount),
-                message,
-                "{name}: message"
-            );
-            assert_eq!(
-                hex::encode(legacy_note_signature_digest_for_hash(&h, amount)),
-                str_of(case, "digest"),
-                "{name}: digest"
-            );
-            // a current mint certifies the same note over its domain and Q
-            if let Some(id) = note_id_of(&k1) {
-                assert_eq!(
-                    note_signature_message(&k1, "mint.example", amount),
-                    Some(format!("LNURLcash:mint.example:{amount}:{id}")),
-                    "{name}"
-                );
-                assert_ne!(id, h, "{name}: a bearer note's id is its Q, not h");
-                assert_eq!(
-                    note_signature_digest(&k1, "mint.example", amount).map(hex::encode),
-                    note_signature_digest_for_hash(&id, "mint.example", amount).map(hex::encode),
-                    "{name}"
-                );
-            }
-        }
     }
 }
 
@@ -330,7 +261,11 @@ fn fee_vectors() {
         for net in round_trip["netAmountsMsat"].as_array().expect("amounts") {
             let net = net.as_u64().expect("amount");
             let gross = gross_up_for_mint_fee(net, fee);
-            assert_eq!(apply_mint_fee(gross, fee), net, "{net} through {fee:?}");
+            // at least net, and exactly net when net is whole satoshis
+            assert!(apply_mint_fee(gross, fee) >= net, "{net} through {fee:?}");
+            if net % 1000 == 0 {
+                assert_eq!(apply_mint_fee(gross, fee), net, "{net} through {fee:?}");
+            }
             assert!(
                 apply_mint_fee(gross - 1, fee) < net,
                 "{net} through {fee:?}: {gross} is not the minimum"
@@ -663,7 +598,9 @@ fn response_vectors() {
         graded > 10,
         "too few response cases graded to mean anything"
     );
-    assert!(cp1_graded >= 3, "0.10.0 carries three cp1 cases");
+    // since 0.17.0 every output is owed its certificate, whatever it is, so
+    // the cases no longer turn on a cp1 output
+    let _ = cp1_graded;
 }
 
 // ---- the informational GET ----
@@ -767,10 +704,10 @@ fn withdraw_info_vectors() {
 // ---- derivation ----
 //
 // The two schemes a wallet may mint under. `cash-derivation.json` is the one
-// LUD-25 specifies and the one a new wallet uses; `derivation.json` is the
-// pre-spec HMAC scheme, kept because notes minted under it are still money.
+// LUD-25 specifies and the one a new wallet uses; the pre-spec HMAC scheme is
+// pinned below, kept because notes minted under it are still money.
 //
-// A disagreement with either file is a wallet that cannot restore what
+// A disagreement with either is a wallet that cannot restore what
 // another implementation of the same seed phrase minted, which is the whole
 // reason these vectors exist rather than each library testing itself.
 
@@ -834,30 +771,29 @@ fn cash_derivation_vectors() {
     }
 }
 
+/// The pre-spec HMAC scheme, kept because notes minted under it are still
+/// money. Conformance dropped `derivation.json` in 0.17.0, so two of its
+/// cases are pinned here.
 #[test]
 fn legacy_derivation_vectors() {
-    let vectors = load("derivation.json");
-
-    assert_eq!(
-        vectors["scheme"]["rootKey"].as_str(),
-        Some("lnurlcash-note-v1")
-    );
-
-    for case in vectors["cases"].as_array().expect("cases") {
-        let name = str_of(case, "name");
-        let seed = hex::decode(str_of(case, "seedHex")).expect("seedHex is hex");
-        let root = derive_note_root(&seed);
-        let k1 = derive_note_secret(
-            &root,
-            &str_of(case, "host"),
-            case["index"].as_u64().unwrap() as u32,
-        );
-        assert_eq!(k1, str_of(case, "k1"), "{name}");
-        assert_eq!(
-            hash_k1(&k1).expect("hash"),
-            str_of(case, "noteId"),
-            "{name}"
-        );
+    const SEED: &str = "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
+    let root = derive_note_root(&hex::decode(SEED).expect("hex"));
+    for (host, index, k1, note_id) in [
+        (
+            "mint.example",
+            0,
+            "1f6016c80339b45dfdd1b3877c1a97d74b063cad54c4ccb866be39ed25ee2ab0",
+            "fe573da4175ab00cb3503e478c1c92626585e99f3e9bf6f0da74697114152ab6",
+        ),
+        (
+            "127.0.0.1:8899",
+            0,
+            "489cf7b0b427ddcd084cfb81290e8a575a5b831d13d42ee061f3e612d85acc29",
+            "167ad167dcef8f18cf58272b123a833c36674693c46690713573de599ab08aee",
+        ),
+    ] {
+        assert_eq!(derive_note_secret(&root, host, index), k1, "{host}");
+        assert_eq!(hash_k1(k1).expect("hash"), note_id, "{host}");
     }
 }
 
@@ -1111,7 +1047,7 @@ fn part2_branch_vectors() {
     assert_eq!(conventions["shareNote"].as_str(), Some("S/a'/2/n'/i"));
     assert_eq!(
         conventions["certificateMessage"].as_str(),
-        Some("LNURLcash:<domain>:<amount_msat>:<hex(Q)>")
+        Some("LNURLcash:<domain>:<amount_msat>:<hex(Q)>:<t>")
     );
 
     let branches = vectors["branches"].as_array().expect("branches");
@@ -1411,17 +1347,18 @@ fn part2_certificate_vectors() {
         let pubkey = str_of(certificate, "notePubkey");
         let domain = str_of(certificate, "domain");
         let amount = certificate["amountMsat"].as_u64().expect("amountMsat");
-        let at = format!("{amount} msat at {domain}");
+        let t = certificate["t"].as_u64().expect("t") as u32;
+        let at = format!("{amount} msat at {domain}, t {t}");
         let message = str_of(certificate, "message");
         let digest = str_of(certificate, "digest");
 
         assert_eq!(
-            note_signature_message_for_hash(&pubkey, &domain, amount),
+            note_signature_message_for_hash(&pubkey, &domain, amount, t),
             Some(message.clone()),
             "{at}"
         );
         assert_eq!(
-            note_signature_digest_for_hash(&pubkey, &domain, amount).map(hex::encode),
+            note_signature_digest_for_hash(&pubkey, &domain, amount, t).map(hex::encode),
             Some(digest.clone()),
             "{at}"
         );
@@ -1429,12 +1366,12 @@ fn part2_certificate_vectors() {
             .get(&pubkey)
             .unwrap_or_else(|| panic!("{at}: the certificate names a note in the file"));
         assert_eq!(
-            note_signature_message(ck1, &domain, amount).as_deref(),
+            note_signature_message(ck1, &domain, amount, t).as_deref(),
             Some(message.as_str()),
             "{at}"
         );
         assert_eq!(
-            note_signature_digest(ck1, &domain, amount).map(hex::encode),
+            note_signature_digest(ck1, &domain, amount, t).map(hex::encode),
             Some(digest.clone()),
             "{at}"
         );
@@ -1445,10 +1382,11 @@ fn part2_certificate_vectors() {
             .try_into()
             .expect("65 bytes");
         let cs1 = str_of(certificate, "cs1");
-        assert_eq!(encode_cs1_with_amount(amount, &signature), cs1, "{at}");
+        assert_eq!(encode_cs1_with_amount(amount, &signature, t), cs1, "{at}");
         let decoded = decode_cs1_with_amount(&cs1).unwrap_or_else(|| panic!("{at}: cs1 decodes"));
         assert_eq!(decoded.amount_msat, amount, "{at}");
         assert_eq!(decoded.signature, signature, "{at}");
+        assert_eq!(decoded.t, t, "{at}");
 
         // RFC6979 on the mint's side too: its key over the digest reproduces
         // the certificate
@@ -1467,22 +1405,25 @@ fn part2_certificate_vectors() {
         // Each recovers to the mint's key: by the note's id and by its cp1 at
         // the certificate's domain, and nowhere else. A current certificate
         // is a cs1, never raw hex.
-        assert!(
+        assert_eq!(
             verify_note_signature_hash(&pubkey, &domain, amount, &cs1, &mint_pubkey),
+            Some(t),
             "{at}"
         );
         assert!(
-            !verify_note_signature_hash(&pubkey, &domain, amount, &signature_hex, &mint_pubkey),
+            verify_note_signature_hash(&pubkey, &domain, amount, &signature_hex, &mint_pubkey)
+                .is_none(),
             "{at}: raw hex"
         );
         assert!(
-            !verify_note_signature_hash(&pubkey, "elsewhere.example", amount, &cs1, &mint_pubkey),
+            verify_note_signature_hash(&pubkey, "elsewhere.example", amount, &cs1, &mint_pubkey)
+                .is_none(),
             "{at}: another domain"
         );
         let cp1 = encode_cp1(&bytes32(certificate, "notePubkey"));
         assert_eq!(
             check_note_certificate(&cp1, &domain, amount, &cs1, &mint_pubkey),
-            Some(CertifiedOver::OutputKey),
+            Some(t),
             "{at}"
         );
         assert_eq!(
@@ -1501,7 +1442,7 @@ fn part2_certificate_vectors() {
             continue;
         }
         let check = check_note(ck1, &domain, amount, &cs1, &mint_pubkey).expect("verifies");
-        assert_eq!(check.certificate, CertifiedOver::OutputKey, "{at}");
+        assert_eq!(check.signed_at, t, "{at}");
         assert_eq!(check.spend, SpendVerdict::Opens, "{at}");
         assert!(
             verify_note_signature(ck1, &domain, amount, &cs1, &mint_pubkey),
@@ -1523,14 +1464,22 @@ fn part2_certificate_vectors() {
         );
         // A cs1 whose prefix states another amount than the one it signs
         // proves nothing, whichever amount is asked about.
-        let relabelled = encode_cs1_with_amount(amount + 1000, &signature);
+        let relabelled = encode_cs1_with_amount(amount + 1000, &signature, t);
         assert!(
-            !verify_note_signature_hash(&pubkey, &domain, amount, &relabelled, &mint_pubkey),
+            verify_note_signature_hash(&pubkey, &domain, amount, &relabelled, &mint_pubkey)
+                .is_none(),
             "{at}: relabelled"
         );
         assert!(
-            !verify_note_signature_hash(&pubkey, &domain, amount + 1000, &relabelled, &mint_pubkey),
+            verify_note_signature_hash(&pubkey, &domain, amount + 1000, &relabelled, &mint_pubkey)
+                .is_none(),
             "{at}: relabelled"
+        );
+        // ...and so does one whose t is not the t it signs
+        let retimed = encode_cs1_with_amount(amount, &signature, t + 1);
+        assert!(
+            verify_note_signature_hash(&pubkey, &domain, amount, &retimed, &mint_pubkey).is_none(),
+            "{at}: retimed"
         );
 
         // The certificate is public, and so is Q. A ck1 pairing them with a
@@ -1552,41 +1501,6 @@ fn part2_certificate_vectors() {
             !verify_note_signature(ck1, "elsewhere.example", amount, &cs1, &mint_pubkey),
             "{at}: another mint"
         );
-    }
-
-    // Certificates over the superseded message without a domain: still read
-    // on notes people hold, reported as legacy, and never the current one.
-    let legacy = vectors["legacyCertificates"]
-        .as_array()
-        .expect("legacyCertificates");
-    assert!(!legacy.is_empty());
-    for certificate in legacy {
-        let pubkey = str_of(certificate, "notePubkey");
-        let amount = certificate["amountMsat"].as_u64().expect("amountMsat");
-        let cs1 = str_of(certificate, "cs1");
-        let at = format!("legacy {amount} msat");
-        assert_eq!(
-            legacy_note_signature_message_for_hash(&pubkey, amount),
-            str_of(certificate, "message"),
-            "{at}"
-        );
-        assert_eq!(
-            hex::encode(legacy_note_signature_digest_for_hash(&pubkey, amount)),
-            str_of(certificate, "digest"),
-            "{at}"
-        );
-        assert!(
-            verify_legacy_note_signature_hash(&pubkey, amount, &cs1, &mint_pubkey),
-            "{at}"
-        );
-        assert!(
-            !verify_note_signature_hash(&pubkey, "mint.example", amount, &cs1, &mint_pubkey),
-            "{at}: not current"
-        );
-        let (ck1, domain) = &ck1_of[&pubkey];
-        let check = check_note(ck1, domain, amount, &cs1, &mint_pubkey).expect("verifies");
-        assert_eq!(check.certificate, CertifiedOver::LegacyOutputKey, "{at}");
-        assert!(check.is_verified(), "{at}");
     }
 }
 
@@ -1818,13 +1732,14 @@ fn lud25_spec_vectors() {
     assert_eq!(q, str_of(spend, "Q"));
     for cert in certificates["cases"].as_array().expect("cases") {
         let amount = cert["amount_msat"].as_u64().expect("amount_msat");
+        let t = cert["t"].as_u64().expect("t") as u32;
         let at = format!("{amount} msat");
         assert_eq!(
-            note_signature_message_for_hash(&q, &domain, amount),
+            note_signature_message_for_hash(&q, &domain, amount, t),
             Some(str_of(cert, "message")),
             "{at}"
         );
-        let digest = note_signature_digest_for_hash(&q, &domain, amount).expect("digest");
+        let digest = note_signature_digest_for_hash(&q, &domain, amount, t).expect("digest");
         assert_eq!(hex::encode(digest), str_of(cert, "digest"), "{at}");
         let signature_hex = sign_certificate(digest);
         assert_eq!(signature_hex, str_of(cert, "signature"), "{at}");
@@ -1832,17 +1747,18 @@ fn lud25_spec_vectors() {
             .expect("hex")
             .try_into()
             .expect("65 bytes");
-        let cs1 = encode_cs1_with_amount(amount, &signature);
+        let cs1 = encode_cs1_with_amount(amount, &signature, t);
         assert_eq!(cs1, str_of(cert, "cs1"), "{at}");
 
-        assert!(
+        assert_eq!(
             verify_note_signature_hash(&q, &domain, amount, &cs1, &mint_pubkey),
+            Some(t),
             "{at}"
         );
         let cp1 = encode_cp1(&bytes32(certificates, "Q"));
         assert_eq!(
             check_note_certificate(&cp1, &domain, amount, &cs1, &mint_pubkey),
-            Some(CertifiedOver::OutputKey),
+            Some(t),
             "{at}"
         );
         assert!(
@@ -1909,13 +1825,14 @@ fn lud25_spec_vectors() {
 
     let cert = &b["certificate"];
     let amount = cert["amount_msat"].as_u64().expect("amount_msat");
+    let t = cert["t"].as_u64().expect("t") as u32;
     let url = str_of(b, "note_url");
     let domain = spend_domain_of(&url).expect("a domain");
     assert_eq!(
-        note_signature_message(&preimage, &url, amount),
+        note_signature_message(&preimage, &url, amount, t),
         Some(str_of(cert, "message"))
     );
-    let digest = note_signature_digest(&preimage, &url, amount).expect("digest");
+    let digest = note_signature_digest(&preimage, &url, amount, t).expect("digest");
     assert_eq!(hex::encode(digest), str_of(cert, "digest"));
     assert_eq!(sign_certificate(digest), str_of(cert, "signature"));
     let cs1 = str_of(cert, "cs1");
@@ -1923,7 +1840,7 @@ fn lud25_spec_vectors() {
         let check = check_note(spend, &domain, amount, &cs1, &mint_pubkey)
             .unwrap_or_else(|| panic!("{spend}: certified"));
         assert_eq!(check.output_key, q);
-        assert_eq!(check.certificate, CertifiedOver::OutputKey);
+        assert_eq!(check.signed_at, t);
         assert!(check.is_verified());
         // the spend opens Q anywhere, but the certificate names one mint
         assert!(check_note(spend, "moneyer.dev", amount, &cs1, &mint_pubkey).is_none());
@@ -1931,16 +1848,101 @@ fn lud25_spec_vectors() {
     for reference in [str_of(b, "h"), cp1] {
         assert_eq!(
             check_note_certificate(&reference, &domain, amount, &cs1, &mint_pubkey),
-            Some(CertifiedOver::OutputKey),
+            Some(t),
             "{reference}"
         );
     }
     assert_eq!(note_declared_amount(&url), Some(amount));
     let check = check_note_url(&url, &mint_pubkey).expect("a certified note");
     assert_eq!(
-        (check.output_key, check.certificate, check.is_verified()),
-        (q, CertifiedOver::OutputKey, true)
+        (check.output_key, check.signed_at, check.is_verified()),
+        (q, t, true)
     );
+
+    // luds fd80cdd: withdrawLink to domain
+    for (link, expected) in v["domains"]["cases"].as_object().expect("domain cases") {
+        assert_eq!(
+            spend_domain_of(link).as_deref(),
+            expected.as_str(),
+            "{link}"
+        );
+    }
+
+    // ...Mint fees, the credit rounded down to whole satoshis, and a split
+    let fees = &v["fees"];
+    for case in fees["parse"].as_array().expect("parse") {
+        let text = str_of(case, "text_plain");
+        let metadata = serde_json::json!([["text/plain", text]]).to_string();
+        // a fee-free mint and an unknown fee both read as no fee here: what
+        // tells them apart is whether the token is there at all
+        let read = parse_mint_fee(&metadata).map(|fee| (fee.base_fee_msat, fee.fee_ppm));
+        let expected = &case["expect"];
+        let expected = (!expected.is_null()).then(|| {
+            (
+                expected["base_fee_msat"].as_u64().expect("base"),
+                expected["fee_ppm"].as_u64().expect("ppm"),
+            )
+        });
+        assert_eq!(read.unwrap_or((0, 0)), expected.unwrap_or((0, 0)), "{text}");
+        if expected.is_none() {
+            assert!(
+                read.is_none(),
+                "{text}: a fee that does not parse is unknown"
+            );
+        }
+    }
+    for case in fees["mint"].as_array().expect("mint") {
+        let fee = MintFee {
+            base_fee_msat: case["base_fee_msat"].as_u64().expect("base"),
+            fee_ppm: case["fee_ppm"].as_u64().expect("ppm"),
+            address_fee_msat: None,
+        };
+        assert_eq!(
+            apply_mint_fee(case["amount_msat"].as_u64().expect("amount"), fee),
+            case["credited_msat"].as_u64().expect("credited"),
+            "{case}"
+        );
+    }
+
+    // ...a timelocked note: the cw1s decode to its Q, which this crate does
+    // not judge, leaving the time claim to the SERVICE
+    let lock = &v["timelock_note"];
+    for spend in lock["spends"].as_array().expect("spends") {
+        let cw1 = str_of(spend, "cw1");
+        let check = check_spend(&cw1, &str_of(lock, "domain")).expect("a spend");
+        assert_eq!(hex::encode(check.output_key), str_of(lock, "Q"));
+        assert_eq!(check.verdict, SpendVerdict::Unevaluated);
+    }
+
+    // ...and the transcript: every answer a WALLET parses, parses
+    for step in v["transcripts"]["steps"].as_array().expect("steps") {
+        let Some(request) = step["request"].as_str() else {
+            continue;
+        };
+        let body = &step["response"];
+        if body["tag"] == "withdrawRequest" {
+            let url = request.trim_start_matches("GET ");
+            let info = parse_note_info(body, url, Policy::default())
+                .unwrap_or_else(|err| panic!("{request}: {err:?}"));
+            assert_eq!(
+                info.max_withdrawable,
+                body["maxWithdrawable"].as_u64().unwrap()
+            );
+            if info.max_withdrawable == 0 {
+                assert!(
+                    info.signature.is_none(),
+                    "{request}: a gone note carries no c"
+                );
+            } else {
+                let c = info.signature.expect("an outstanding note's c");
+                let k1 = info.k1.clone();
+                assert!(
+                    verify_note_signature(&k1, url, info.max_withdrawable, &c, &mint_pubkey),
+                    "{request}"
+                );
+            }
+        }
+    }
 }
 
 /// LUD-26's own published test vectors, luds' 26-vectors.json, as

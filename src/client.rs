@@ -21,8 +21,8 @@ pub enum NoteFate {
     /// Still outstanding: the request never landed, so the fresh secrets minted
     /// nothing and can be discarded.
     Live,
-    /// The SERVICE reports it spent or unknown: the burn landed, and the
-    /// carried secrets are the only money left.
+    /// The SERVICE reports it worth 0 or unknown: the burn landed (or a melt
+    /// holds it), and the carried secrets are the only money left.
     Gone,
     /// The probe itself failed. No information either way - keep everything.
     Unknown,
@@ -88,7 +88,10 @@ pub struct SplitOutcome {
 
 #[derive(Debug, Clone)]
 pub struct MeltOutcome {
+    /// An echoed `pr`, which some SERVICEs send.
     pub pr: Option<String>,
+    /// LUD-21 `verify` for this melt, the same on a retry: follow it with
+    /// [`Client::fetch_melt_state`]. `None` from a non-conforming SERVICE.
     pub verify: Option<String>,
 }
 
@@ -112,6 +115,28 @@ impl Default for Client {
     }
 }
 
+/// Which redirects to follow. Every hop must pass the same admission rule as
+/// the first URL, and a request carrying a spend (`k1` in its query) is never
+/// followed to another host: LUD-25 has a WALLET refuse a redirect that would
+/// hand the spend to anyone but the mint it was meant for (luds `fd80cdd`).
+fn follow_redirect(attempt: reqwest::redirect::Attempt) -> reqwest::redirect::Action {
+    if attempt.previous().len() >= 5 {
+        return attempt.error("too many redirects");
+    }
+    let next = attempt.url();
+    if !is_allowed_service_url(next.as_str()) {
+        return attempt.error("refusing a redirect to a URL that may not be fetched");
+    }
+    let Some(first) = attempt.previous().first() else {
+        return attempt.follow();
+    };
+    let carries_spend = first.query_pairs().any(|(key, _)| key == "k1");
+    if carries_spend && first.host_str() != next.host_str() {
+        return attempt.error("refusing a redirect that would carry a spend to another host");
+    }
+    attempt.follow()
+}
+
 impl Client {
     pub fn new() -> Self {
         Self::with_config(ClientConfig::default())
@@ -120,6 +145,7 @@ impl Client {
     pub fn with_config(config: ClientConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
+            .redirect(reqwest::redirect::Policy::custom(follow_redirect))
             .build()
             .unwrap_or_default();
         Client { http, config }
@@ -224,9 +250,9 @@ impl Client {
     /// without exposing it"). What a restore walk uses: it queries a whole
     /// gap window of indices the wallet has not minted into yet.
     ///
-    /// A rejection means nothing on its own: a SERVICE answers a note that
-    /// was burned exactly as one it never issued, so only a positive answer
-    /// is evidence of anything.
+    /// Any answer is a used index, worth 0 included (burned, or a melt in
+    /// flight); [`Error::NoteUnknown`] for `unknown note` is an unused one,
+    /// and anything else is retried (LUD-26).
     ///
     /// `h` is a `cp1` or a bearer note's hash;
     /// [`crate::recoverable::note_lookup_of`] gives the right one for any k1.
@@ -358,9 +384,20 @@ impl Client {
         protocol::parse_verify(&body)
     }
 
+    /// Where a melt stands, from the `verify` its `OK` carried
+    /// ([`MeltOutcome::verify`]): in flight, settled with its preimage, or
+    /// failed with the note restored. Polling it never puts the spend on the
+    /// wire again.
+    pub async fn fetch_melt_state(&self, verify_url: &str) -> Result<protocol::MeltState> {
+        let body = self.run(protocol::verify_request(verify_url)?).await?;
+        protocol::parse_melt_verify(&body)
+    }
+
     /// After an ambiguous mutation: did the burn actually happen?
     pub async fn probe_burned_note(&self, url: &str) -> NoteFate {
         match self.fetch_note_info(url).await {
+            // a burned note answers worth 0 since luds fd80cdd
+            Ok(info) if info.is_empty() => NoteFate::Gone,
             Ok(_) => NoteFate::Live,
             Err(Error::NoteSpent { .. }) | Err(Error::NoteUnknown { .. }) => NoteFate::Gone,
             Err(_) => NoteFate::Unknown,
@@ -399,6 +436,11 @@ impl Client {
         let url = with_new_k1(base_url, k1, expected_amount_msat, signature)
             .ok_or_else(|| Error::RequestRefused("that note URL does not parse".into()))?;
         let info = self.fetch_note_info(&url).await?;
+        // Worth 0: burned, or a melt in flight. Either way there is nothing
+        // to settle, and the rotate would only be refused.
+        if info.is_empty() {
+            return Err(Error::NoteEmpty);
+        }
         match self.rotate_note(&info.callback, k1).await {
             Ok(rotated) => Ok(SettledNote {
                 k1: rotated.k1,

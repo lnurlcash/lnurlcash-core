@@ -12,13 +12,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use lnurlcash_core::client::{Client, ClientConfig, NoteFate};
-use lnurlcash_core::protocol::{parse_mutation, rotate_request_with_hash, MutationKind, Policy};
+use lnurlcash_core::protocol::{
+    parse_mutation, rotate_request_with_hash, MeltState, MutationKind, Policy,
+};
 use lnurlcash_core::recoverable::{encode_ck1, encode_cp1, encode_cw1, sign_note_ownership};
 use lnurlcash_core::spend::bearer_cw1;
 use lnurlcash_core::{
     build_note_url, check_note, check_note_certificate, check_note_url, check_spend, hash_k1,
-    note_id_of, note_lookup_of, verify_note_signature, with_new_k1, CertifiedOver, Error,
-    SpendVerdict,
+    note_id_of, note_lookup_of, verify_note_signature, with_new_k1, Error, SpendVerdict,
 };
 use serde_json::Value;
 
@@ -168,6 +169,15 @@ macro_rules! mint_or_skip {
 
 // ---- the informational GET ----
 
+/// A certificate's `t` is the mock's clock, which is this machine's.
+fn signed_recently(t: u32) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    now.abs_diff(u64::from(t)) < 300
+}
+
 #[tokio::test]
 async fn reports_value_and_never_burns() {
     let mint = mint_or_skip!(&[]);
@@ -240,9 +250,16 @@ async fn unknown_and_spent_are_different_answers() {
         .unwrap_err();
     assert!(matches!(err, Error::NoteUnknown { .. }), "got {err:?}");
 
+    // a spent note answers the informational GET worth 0 (luds fd80cdd),
+    // and the callback still names it spent
     client.rotate_note(&mint.callback(), &known).await.unwrap();
-    let err = client
+    let info = client
         .fetch_note_info(&mint.note_url(&known))
+        .await
+        .unwrap();
+    assert!(info.is_empty() && info.signature.is_none(), "{info:?}");
+    let err = client
+        .rotate_note(&mint.callback(), &known)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NoteSpent { .. }), "got {err:?}");
@@ -282,12 +299,12 @@ async fn rotate_burns_the_old_secret_and_mints_one_the_service_never_saw() {
     ));
 }
 
-/// A mint from before luds 92abbb3 that forwarded its node's signmessage
-/// output unreordered: `recovery_id || r || s`, over the message without a
-/// domain. Notes people hold carry such certificates, so they still verify,
-/// as legacy; a current certificate is only ever `r || s || recovery_id`.
+/// A mint that forwards its node's signmessage output unreordered,
+/// `recovery_id || r || s`, issues certificates no wallet reads: LUD-25's is
+/// `r || s || recovery_id || t`, and since luds fd80cdd nothing else is
+/// accepted.
 #[tokio::test]
-async fn accepts_the_other_recovery_id_layout_as_legacy() {
+async fn refuses_the_other_recovery_id_layout() {
     let mint = mint_or_skip!(&["--signatureLayout=leading"]);
     let client = Client::new();
     let k1 = secret(7);
@@ -295,10 +312,7 @@ async fn accepts_the_other_recovery_id_layout_as_legacy() {
 
     let rotated = client.rotate_note(&mint.callback(), &k1).await.unwrap();
     let signature = rotated.signature.expect("mint signs");
-    let check = check_note(&rotated.k1, &mint.url, 21000, &signature, &mint.pubkey)
-        .expect("an older certificate is still a certificate");
-    assert_eq!(check.certificate, CertifiedOver::LegacyOutputKey);
-    assert!(verify_note_signature(
+    assert!(!verify_note_signature(
         &rotated.k1,
         &mint.url,
         21000,
@@ -455,37 +469,38 @@ async fn settle_surfaces_an_unconfirmable_rotate_rather_than_the_burned_k1() {
 }
 
 #[tokio::test]
-async fn settle_reports_a_note_whose_melt_is_still_in_flight_as_pending() {
+async fn settle_reports_a_note_whose_melt_is_still_in_flight_as_empty() {
     let mint = mint_or_skip!(&["--meltNeverSettles=true"]);
     let client = Client::new();
     let k1 = secret(51);
     mint.credit(&k1, 21000).await;
-    // a melt in flight locks every other operation on the note out, and the
-    // SERVICE now says so on the informational GET as well as the mutation:
-    // an unresolved melt answers `pending` rather than describing the note
-    client
+    let melt = client
         .melt_note(&mint.callback(), &k1, "lnbc210n1pjqrstuvwxyz")
         .await
         .unwrap();
 
-    // So settling stops before the rotate, and the caller hears the one word
-    // that matters. This USED to come back as a settled 21000 msat note, on
-    // the reasoning that a refusal which burned nothing leaves the note
-    // alone - true of the rotate, but the wrong thing to tell a holder: the
-    // melt may be about to consume this note, and a caller told it settled
-    // would be counting money that is already leaving. Pending is not a
-    // failure, it is an answer, and the caller reconciles rather than
-    // believing either that the note is gone or that it is safely theirs.
+    // A melt in flight answers the informational GET worth 0, as a burned
+    // note does (luds fd80cdd), so settling stops before the rotate and says
+    // there is nothing to settle. It is not a settled note: the melt may be
+    // about to consume it, and a caller told it settled would be counting
+    // money that is already leaving.
     let err = client
         .settle_note(&mint.note_url(&k1), &k1, 0, None)
         .await
         .expect_err("a note with a melt in flight is not a settled note");
-    assert!(matches!(err, Error::NotePending), "got {err:?}");
+    assert!(matches!(err, Error::NoteEmpty), "got {err:?}");
 
     // nothing was burned getting that answer, and no fresh secret was minted
     // that a caller would now have to keep
     assert_eq!(mint.note_state(&k1).await.as_deref(), Some("pending"));
     assert!(err.new_secrets().is_empty());
+
+    // the melt's own verify is what says it is still in flight
+    let verify = melt.verify.expect("a melt carries verify");
+    assert_eq!(
+        client.fetch_melt_state(&verify).await.unwrap(),
+        MeltState::InFlight
+    );
 }
 
 /// A retried mutation the SERVICE already performed looks exactly like this
@@ -526,8 +541,18 @@ async fn melt_ok_means_in_flight_not_spent() {
         .melt_note(&mint.callback(), &k1, "lnbc210n1pjqrstuvwxyz")
         .await
         .unwrap();
-    assert_eq!(result.pr.as_deref(), Some("lnbc210n1pjqrstuvwxyz"));
     assert_eq!(mint.note_state(&k1).await.as_deref(), Some("pending"));
+    // the melt's verify says so too, and a retry gets the same one
+    let verify = result.verify.expect("a melt carries verify");
+    assert_eq!(
+        client.fetch_melt_state(&verify).await.unwrap(),
+        MeltState::InFlight
+    );
+    let again = client
+        .melt_note(&mint.callback(), &k1, "lnbc210n1pjqrstuvwxyz")
+        .await
+        .unwrap();
+    assert_eq!(again.verify.as_deref(), Some(verify.as_str()));
 
     // and every other operation is locked out until it resolves
     let err = client.rotate_note(&mint.callback(), &k1).await.unwrap_err();
@@ -576,8 +601,10 @@ async fn mints_a_note_the_service_never_saw_the_secret_of() {
         .unwrap();
     assert!(!invoice.disposable);
     let verify_url = invoice.verify.expect("LUD-21 verify");
-    let payment_hash = verify_url.rsplit('/').next().unwrap().to_string();
-    mint.settle(&payment_hash).await;
+    // the verify URL is an unguessable token, never the payment hash (luds
+    // fd80cdd); the mock's settle hook takes either
+    let token = verify_url.rsplit('/').next().unwrap().to_string();
+    mint.settle(&token).await;
 
     let verified = client
         .fetch_invoice_verification(&verify_url)
@@ -588,7 +615,7 @@ async fn mints_a_note_the_service_never_saw_the_secret_of() {
     // forwarded the payment learned it; under the earlier draft that made all
     // of them holders of the note. Here it redeems nothing.
     let preimage = verified.preimage.expect("preimage disclosed");
-    assert_eq!(hash_k1(&preimage).unwrap(), payment_hash);
+    assert!(!verify_url.contains(&hash_k1(&preimage).unwrap()));
     assert_ne!(preimage, mint_secret);
     let preimage_url = build_note_url(&withdraw_link, &preimage, None).unwrap();
     assert!(
@@ -656,13 +683,20 @@ async fn reads_an_advertised_fee() {
 
 // ---- a no-signer legacy mint is tolerated ----
 
-/// A reference mint without a signer can confirm a legacy rotate or split
-/// without returning the raw Part 1 proof. The tolerant policy preserves the
-/// landed outputs; strict reference-wallet parity is tested below.
+/// A mint without a signer confirms a rotate or split with no certificate.
+/// LUD-25 requires one (luds fd80cdd), so only a caller that opts out of
+/// `require_signatures` takes the outputs as they are; the default refusal
+/// is tested below.
 #[tokio::test]
-async fn a_no_signer_legacy_mint_is_tolerated_by_default() {
+async fn a_no_signer_mint_is_tolerated_only_by_opting_out() {
     let mint = mint_or_skip!(&["--signatures=false"]);
-    let client = Client::new();
+    let client = Client::with_config(ClientConfig {
+        policy: Policy {
+            require_signatures: false,
+            ..Policy::default()
+        },
+        ..ClientConfig::default()
+    });
     let k1 = secret(29);
     mint.credit(&k1, 21000).await;
 
@@ -756,6 +790,66 @@ fn canned_service(canned: Canned) -> String {
         }
     });
     url
+}
+
+/// A one-shot service on loopback that redirects its first request.
+fn redirecting_service(location: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let url = format!("http://{}", listener.local_addr().expect("an address"));
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut chunk = [0u8; 1024];
+        let _ = stream.read(&mut chunk);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+    });
+    url
+}
+
+/// LUD-25 (luds fd80cdd): a WALLET never follows a redirect carrying a spend
+/// to another host. The same host, on another port, is still the mint.
+#[tokio::test]
+async fn a_redirect_carrying_a_spend_stays_on_its_host() {
+    let k1 = secret(70);
+    let note = |base: &str| format!("{base}/w?k1={k1}");
+    let answer = |base: &str| {
+        serde_json::json!({
+            "tag": "withdrawRequest",
+            "callback": format!("{base}/w/cb"),
+            "k1": k1,
+            "maxWithdrawable": 21000,
+            "mintPubkey": format!("02{}", "aa".repeat(32)),
+            "payLink": format!("{base}/.well-known/lnurlp/mint"),
+        })
+        .to_string()
+    };
+    let client = Client::new();
+
+    let same_host = canned_service(Canned::Answer(200, answer("http://127.0.0.1")));
+    let hop = redirecting_service(note(&same_host));
+    let info = client.fetch_note_info(&note(&hop)).await;
+    assert!(info.is_ok(), "{info:?}");
+
+    // control: localhost reaches these services, so a refusal below is the
+    // redirect policy and not an unreachable host
+    let direct = canned_service(Canned::Answer(200, answer("http://localhost")));
+    let reached = client
+        .fetch_note_info(&note(&direct.replace("127.0.0.1", "localhost")))
+        .await;
+    assert!(reached.is_ok(), "{reached:?}");
+
+    let other = canned_service(Canned::Answer(200, answer("http://localhost")));
+    let elsewhere = other.replace("127.0.0.1", "localhost");
+    let hop = redirecting_service(note(&elsewhere));
+    let refused = client.fetch_note_info(&note(&hop)).await;
+    assert!(
+        refused.is_err(),
+        "followed a spend to another host: {refused:?}"
+    );
 }
 
 /// responses.json through the client's own transport, a 500, a dropped
@@ -1158,7 +1252,7 @@ async fn a_key_path_note_spends_by_a_ck1_bound_to_its_mint() {
     // hex(Q), and the wallet can check both halves of that offline.
     let sig = info.signature.clone().expect("certified");
     let check = check_note(&ck1, &mint.url, 21000, &sig, &mint.pubkey).expect("certified");
-    assert_eq!(check.certificate, CertifiedOver::OutputKey);
+    assert!(signed_recently(check.signed_at), "{check:?}");
     assert_eq!(check.spend, SpendVerdict::Opens);
 
     let rotated = client.rotate_note(&info.callback, &ck1).await.unwrap();
@@ -1173,7 +1267,7 @@ async fn a_key_path_note_spends_by_a_ck1_bound_to_its_mint() {
     .expect("a note URL");
     let check = check_note_url(&url, &mint.pubkey).expect("a certified note");
     assert!(check.is_verified(), "{check:?}");
-    assert_eq!(check.certificate, CertifiedOver::OutputKey);
+    assert!(signed_recently(check.signed_at), "{check:?}");
 }
 
 #[tokio::test]
@@ -1243,9 +1337,9 @@ async fn looks_a_note_up_by_p_without_its_spend() {
             .unwrap_or_else(|err| panic!("{reference}: {err}"));
         assert_eq!(info.max_withdrawable, 21000);
         let sig = info.signature.expect("certified");
-        assert_eq!(
-            check_note_certificate(&reference, &mint.url, 21000, &sig, &mint.pubkey),
-            Some(CertifiedOver::OutputKey),
+        assert!(
+            check_note_certificate(&reference, &mint.url, 21000, &sig, &mint.pubkey)
+                .is_some_and(signed_recently),
             "{reference}"
         );
     }
@@ -1286,26 +1380,4 @@ async fn an_output_already_in_use_is_refused_and_nothing_burns() {
         assert_eq!(info.max_withdrawable, 21000);
     }
     assert_eq!(mint.note_state(&k1).await.as_deref(), Some("outstanding"));
-}
-
-#[tokio::test]
-async fn a_certificate_over_h_from_an_older_mint_still_verifies_as_legacy() {
-    let mint = mint_or_skip!(&["--certificateOverH=true"]);
-    let client = Client::new();
-    let k1 = secret(64);
-    mint.credit(&k1, 21000).await;
-
-    let rotated = client.rotate_note(&mint.callback(), &k1).await.unwrap();
-    let sig = rotated.signature.expect("certified");
-    let check = check_note(&rotated.k1, &mint.url, 21000, &sig, &mint.pubkey)
-        .expect("a pre-taproot certificate is still a certificate");
-    assert_eq!(check.certificate, CertifiedOver::LegacyHash);
-    assert!(check.is_verified());
-    assert!(verify_note_signature(
-        &rotated.k1,
-        &mint.url,
-        21000,
-        &sig,
-        &mint.pubkey
-    ));
 }

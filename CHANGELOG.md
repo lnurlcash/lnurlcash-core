@@ -3,7 +3,64 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
-## 0.3.1 - unreleased
+## 0.4.0 - unreleased
+
+Breaking. Follows LUD-25 as of lnurl/luds `fd80cdd` and grades against
+`lnurlcash-conformance` 0.17.0.
+
+### What breaks for people's wallets
+
+- **Every certificate a wallet holds stops verifying.** A `cs1` is now
+  69 bytes, `r || s || recovery-id || u32 t`, over
+  `LNURLcash:<domain>:<amount_msat>:<hex(Q)>:<t>`, and the 65-byte ones from
+  before are refused: a clean break. Notes are unaffected; fetch a fresh
+  certificate with the informational GET.
+- **A spent note no longer errors at the informational GET.** It answers
+  worth 0 with no certificate, and so does a note with a melt in flight.
+  `fetch_note_info` returns it (`WithdrawRequestInfo::is_empty()`), where it
+  used to return `Error::NoteSpent`; `settle_note` refuses it with the new
+  `Error::NoteEmpty`; `probe_burned_note` reads it as `Gone`. The callback
+  still answers `already in use` and `pending`.
+- **A mint without `mintPubkey`, or a note without `payLink`, is refused.**
+  `parse_pay_request` requires `mintPubkey` on a minting payRequest, and
+  `parse_note_info`/`parse_note_info_by_hash` require LUD-19 `payLink`.
+- **Every output is owed its certificate.** `Policy::require_signatures` now
+  defaults to true: a rotate, split or merge confirmed without one is
+  `Error::Unverifiable`, with the fresh secrets. Turn it off for a mint with
+  no signer.
+- **Fees round down.** `apply_mint_fee` rounds the credit down to whole
+  satoshis, a `Mint fees` base that is not a multiple of 1000 reads as an
+  unknown fee, and a split amount must be whole satoshis.
+
+### Changes
+
+- Certificates: `encode_cs1_with_amount(amount, sig, t)`; `Cs1.t`;
+  `note_signature_message*`/`note_signature_digest*` take `t`;
+  `verify_note_signature_hash` and `check_note_certificate` return the `t`
+  they verified (`Option<u32>`); `NoteCheck.signed_at` replaces
+  `NoteCheck.certificate`. Removed: `CertifiedOver`,
+  `legacy_note_signature_*`, `verify_legacy_note_signature_hash`, and the
+  fixed-HRP `encode_cs1`/`decode_cs1`/`is_cs1`/`decode_any_cs1`/`is_any_cs1`.
+  The FFI follows (`FfiNoteCheck.signed_at`, `FfiCs1.t`, `FfiCertifiedOver`
+  gone).
+- Melts: `parse_melt_verify` and `Client::fetch_melt_state` read a melt's
+  LUD-21 `verify` as `MeltState::{InFlight, Settled { preimage }, Failed}`,
+  `Failed` being `Not found` once the payment failed and the note is
+  restored. FFI `parse_melt_verify`. `MeltOutcome.verify` is required by
+  LUD-25; a melt without one still succeeds.
+- Reasons: `classify_note_error` reads LUD-25's exact `unknown note` and
+  `already in use` first (`errors::UNKNOWN_NOTE`), the older wordings after.
+- `WithdrawRequestInfo.pay_link` and `NoteInfoByHash.pay_link` (and FFI).
+- `spend_domain_of` drops a trailing dot, so a domain is the host
+  lowercased, A-label, without port, userinfo or trailing dot.
+- The client follows no redirect that would carry a spend (`k1`) to another
+  host, and every hop must pass `is_allowed_service_url`.
+- `split_request*` refuses an amount that is not whole satoshis.
+- The certificate names `sig`/`sig2` are no longer read.
+- `legacy_derivation_vectors` pins two cases of the pre-spec HMAC scheme
+  itself, since conformance 0.17.0 dropped `derivation.json`.
+
+## 0.3.1 - 2026-11-03
 
 Grades against `lnurlcash-conformance` 0.16.1.
 

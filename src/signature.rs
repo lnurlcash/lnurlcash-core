@@ -9,20 +9,19 @@
 //! Lightning node's signed messages can verify a note.
 //!
 //! ```text
-//! message = "LNURLcash:" || domain || ":" || amount_msat (decimal ASCII) || ":" || hex(Q)
+//! message = "LNURLcash:" || domain || ":" || amount_msat || ":" || hex(Q) || ":" || t
 //! digest  = sha256(sha256("Lightning Signed Message:" || message))
+//! cs1     = bech32m("cs" || amount suffix, r || s || recovery-id || u32be(t))
 //! ```
 //!
-//! `domain` is the mint's lowercase hostname, the string the canonical spend
-//! transaction commits to, so a certificate names the one mint on that domain
-//! and never vouches for a note at another. `Q` is the note's taproot output
-//! key, for every kind of note: a bearer note's `Q` is public too, so a
-//! SERVICE can certify one without disclosing what spends it.
-//!
-//! Two older messages are still read, never written, since notes people hold
-//! carry them: `hex(Q)` without the domain (before luds 92abbb3), reported as
-//! [`CertifiedOver::LegacyOutputKey`], and a bearer note's hash `h` from
-//! before notes were keyed by `Q`, reported as [`CertifiedOver::LegacyHash`].
+//! `domain` is the string the canonical spend transaction commits to, so a
+//! certificate names the one mint on that domain and never vouches for a
+//! note at another. `Q` is the note's taproot output key, for every kind of
+//! note: a bearer note's `Q` is public too, so a SERVICE can certify one
+//! without disclosing what spends it. `t` is the Unix time of signing in
+//! seconds (luds `fd80cdd`): a certificate attests that `Q` was outstanding
+//! with that value at `t`, and a holder weighs its age. Certificates from
+//! before, 65 bytes without `t`, are refused: a clean break.
 //!
 //! A certificate proves issuance, not that the spend in hand opens the note:
 //! a `ck1` states its `Q` in plain sight, so anyone who has seen a note's
@@ -34,8 +33,8 @@ use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 use secp256k1::Message;
 use sha2::{Digest, Sha256};
 
-use crate::recoverable::{decode_cs1, decode_cs1_with_amount, decode_cx1, encode_cx1, note_id_of};
-use crate::spend::{check_spend, decode_note, decode_spend, spend_domain_of, SpendVerdict};
+use crate::recoverable::{decode_cs1_with_amount, decode_cx1, encode_cx1, note_id_of};
+use crate::spend::{check_spend, decode_note, spend_domain_of, SpendVerdict};
 
 const LIGHTNING_SIGNED_MESSAGE_PREFIX: &[u8] = b"Lightning Signed Message:";
 const DOMAIN_TAG: &str = "LNURLcash";
@@ -169,228 +168,105 @@ pub(crate) fn lightning_signed_digest(message: &str) -> [u8; 32] {
 }
 
 /// The message a SERVICE certifies for the note `k1` spends at `domain` (a
-/// note URL, a mint URL or a bare host). `None` for a `k1` that is no spend
-/// (see [`note_id_of`]) or a `domain` that names none.
-pub fn note_signature_message(k1: &str, domain: &str, amount_msat: u64) -> Option<String> {
-    note_signature_message_for_hash(&note_id_of(k1)?, domain, amount_msat)
+/// note URL, a mint URL or a bare host), signed at Unix time `t`. `None` for
+/// a `k1` that is no spend (see [`note_id_of`]) or a `domain` that names
+/// none.
+pub fn note_signature_message(k1: &str, domain: &str, amount_msat: u64, t: u32) -> Option<String> {
+    note_signature_message_for_hash(&note_id_of(k1)?, domain, amount_msat, t)
 }
 
 /// The same message over a note id given directly, `hex(Q)`, used exactly
-/// as given, lowercased. `None` for a `domain` that names none.
-pub fn note_signature_message_for_hash(id: &str, domain: &str, amount_msat: u64) -> Option<String> {
+/// as given, lowercased. `None` for a `domain` that names none. What a
+/// SERVICE hands its node's signmessage, `t` its own clock's now; then
+/// [`crate::encode_cs1_with_amount`] with the same `t`.
+pub fn note_signature_message_for_hash(
+    id: &str,
+    domain: &str,
+    amount_msat: u64,
+    t: u32,
+) -> Option<String> {
     Some(format!(
-        "{DOMAIN_TAG}:{}:{amount_msat}:{}",
+        "{DOMAIN_TAG}:{}:{amount_msat}:{}:{t}",
         spend_domain_of(domain)?,
         id.trim().to_ascii_lowercase()
     ))
 }
 
-pub fn note_signature_digest(k1: &str, domain: &str, amount_msat: u64) -> Option<[u8; 32]> {
-    note_signature_digest_for_hash(&note_id_of(k1)?, domain, amount_msat)
+pub fn note_signature_digest(k1: &str, domain: &str, amount_msat: u64, t: u32) -> Option<[u8; 32]> {
+    note_signature_digest_for_hash(&note_id_of(k1)?, domain, amount_msat, t)
 }
 
 pub fn note_signature_digest_for_hash(
     id: &str,
     domain: &str,
     amount_msat: u64,
+    t: u32,
 ) -> Option<[u8; 32]> {
-    note_signature_message_for_hash(id, domain, amount_msat)
+    note_signature_message_for_hash(id, domain, amount_msat, t)
         .map(|message| lightning_signed_digest(&message))
-}
-
-/// The superseded message without a domain, `LNURLcash:<amount>:<id>`, over
-/// `hex(Q)` or a bearer note's `h`. Read, never written: a SERVICE MUST NOT
-/// issue it any more.
-pub fn legacy_note_signature_message_for_hash(id: &str, amount_msat: u64) -> String {
-    format!(
-        "{DOMAIN_TAG}:{amount_msat}:{}",
-        id.trim().to_ascii_lowercase()
-    )
-}
-
-pub fn legacy_note_signature_digest_for_hash(id: &str, amount_msat: u64) -> [u8; 32] {
-    lightning_signed_digest(&legacy_note_signature_message_for_hash(id, amount_msat))
-}
-
-/// Which message a certificate verified over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CertifiedOver {
-    /// `hex(Q)` at the note's domain: LUD-25's certificate, for any note.
-    OutputKey,
-    /// `hex(Q)` with no domain, as a SERVICE signed before luds 92abbb3. It
-    /// still proves issuance of that note for that amount by that key, but
-    /// not at which of the key's mints.
-    LegacyOutputKey,
-    /// A bearer note's hash `h`, as a SERVICE signed before notes were keyed
-    /// by `Q`. It still proves issuance of that note for that amount.
-    LegacyHash,
 }
 
 fn is_hex_id(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-// The signature bytes, from a cs1 that states `amount_msat`, or for a legacy
-// message also from a fixed-HRP cs1 or raw hex. `lenient` admits a recovery
-// id outside 0..=3, which only a certificate in the leading layout has.
-fn certificate_bytes(signature: &str, amount_msat: u64, lenient: bool) -> Option<Vec<u8>> {
-    let trimmed = signature.trim();
-    if let Some(cs1) = decode_cs1_with_amount(trimmed) {
-        // An amount-bearing cs1 must state the amount it signs: a payload
-        // moved under another amount's prefix would otherwise verify while
-        // displaying an amount nobody certified.
-        return (cs1.amount_msat == amount_msat).then(|| cs1.signature.to_vec());
-    }
-    if !lenient {
-        return None;
-    }
-    decode_any_cs1_bytes(trimmed)
-        .or_else(|| hex::decode(trimmed).ok())
-        .filter(|bytes| bytes.len() == 65)
-}
-
-// A cs1 of any amount or none, recovery id unchecked, for the legacy layouts.
-fn decode_any_cs1_bytes(value: &str) -> Option<Vec<u8>> {
-    if let Some(signature) = decode_cs1(value) {
-        return Some(signature.to_vec());
-    }
-    let separator = value.rfind('1')?;
-    let hrp = value[..separator].to_ascii_lowercase();
-    hrp.strip_prefix("cs")?;
-    crate::long_bech32::decode::<crate::long_bech32::Bech32m>(&hrp, value)
-}
-
-// Which end of the raw bytes carries the recovery id varies by
-// implementation: LUD-25 calls for `r || s || recovery_id`, the layout raw
-// BOLT-11 signatures use, while lnurl-mint once forwarded its node's
-// signmessage output unreordered as `recovery_id || r || s`. A current
-// certificate is only ever the first; the legacy messages try both, which
-// costs nothing security-wise - recovering against the wrong one yields an
-// unrelated pubkey that cannot match.
-fn recovers_to(
-    digest: [u8; 32],
-    signature: &[u8],
-    both_layouts: bool,
-    mint_pubkey_hex: &str,
-) -> bool {
-    let message = Message::from_digest(digest);
+// Does `signature` (r || s || recovery-id) recover to `mint_pubkey_hex`?
+fn recovers_to(digest: [u8; 32], signature: &[u8; 65], mint_pubkey_hex: &str) -> bool {
     let target = mint_pubkey_hex.trim().to_ascii_lowercase();
-    let trailing = (&signature[..64], signature[64]);
-    let leading = (&signature[1..65], signature[0]);
-    let layouts: &[(&[u8], u8)] = if both_layouts {
-        &[trailing, leading]
-    } else {
-        &[trailing]
+    let Ok(id) = RecoveryId::try_from(i32::from(signature[64])) else {
+        return false;
     };
-    layouts.iter().any(|&(compact, recovery)| {
-        let Ok(id) = RecoveryId::try_from(i32::from(recovery)) else {
-            return false;
-        };
-        let Ok(sig) = RecoverableSignature::from_compact(compact, id) else {
-            return false;
-        };
-        sig.recover_ecdsa(message)
-            .is_ok_and(|recovered| hex::encode(recovered.serialize()) == target)
-    })
+    let Ok(sig) = RecoverableSignature::from_compact(&signature[..64], id) else {
+        return false;
+    };
+    sig.recover_ecdsa(Message::from_digest(digest))
+        .is_ok_and(|recovered| hex::encode(recovered.serialize()) == target)
 }
 
-/// Check a current certificate over exactly the 64-hex `id` given, `hex(Q)`,
-/// at `domain` (a note URL, a mint URL or a bare host). The primitive the
-/// other checks here are built on; prefer [`check_note`] or
-/// [`check_note_certificate`], which work out the id themselves and fall back
-/// to the legacy messages.
+/// Check a certificate over exactly the 64-hex `id` given, `hex(Q)`, at
+/// `domain` (a note URL, a mint URL or a bare host). The primitive the other
+/// checks here are built on; prefer [`check_note`] or
+/// [`check_note_certificate`], which work out the id themselves.
 ///
-/// `signature` is an amount-bearing `cs1`, which must state `amount_msat` in
-/// its human-readable part as well as sign it, with its recovery id last.
-///
-/// Never panics. An unverifiable signature is a `false`.
+/// `signature` is a `cs1`, which must state `amount_msat` in its
+/// human-readable part as well as sign it. Returns the time it was signed
+/// at, `t`, or `None` when it does not verify. Never panics.
 pub fn verify_note_signature_hash(
     id: &str,
     domain: &str,
     amount_msat: u64,
     signature: &str,
     mint_pubkey_hex: &str,
-) -> bool {
+) -> Option<u32> {
     let id = id.trim();
     if !is_hex_id(id) {
-        return false;
+        return None;
     }
-    let (Some(digest), Some(signature)) = (
-        note_signature_digest_for_hash(id, domain, amount_msat),
-        certificate_bytes(signature, amount_msat, false),
-    ) else {
-        return false;
-    };
-    recovers_to(digest, &signature, false, mint_pubkey_hex)
-}
-
-/// [`verify_note_signature_hash`] for the superseded message without a
-/// domain, over `hex(Q)` or a bearer note's `h`. `signature` may also be raw
-/// hex or a fixed-HRP `cs1`, in either recovery-id layout, as certificates
-/// were issued then.
-pub fn verify_legacy_note_signature_hash(
-    id: &str,
-    amount_msat: u64,
-    signature: &str,
-    mint_pubkey_hex: &str,
-) -> bool {
-    let id = id.trim();
-    if !is_hex_id(id) {
-        return false;
+    let cs1 = decode_cs1_with_amount(signature)?;
+    // A cs1 must state the amount it signs: a payload moved under another
+    // amount's prefix would otherwise verify while displaying an amount
+    // nobody certified.
+    if cs1.amount_msat != amount_msat {
+        return None;
     }
-    let Some(signature) = certificate_bytes(signature, amount_msat, true) else {
-        return false;
-    };
-    recovers_to(
-        legacy_note_signature_digest_for_hash(id, amount_msat),
-        &signature,
-        true,
-        mint_pubkey_hex,
-    )
-}
-
-fn certified_over(
-    output_key: &[u8; 32],
-    bearer_hash: Option<[u8; 32]>,
-    domain: &str,
-    amount_msat: u64,
-    signature: &str,
-    mint_pubkey: &str,
-) -> Option<CertifiedOver> {
-    let q = hex::encode(output_key);
-    if verify_note_signature_hash(&q, domain, amount_msat, signature, mint_pubkey) {
-        return Some(CertifiedOver::OutputKey);
-    }
-    if verify_legacy_note_signature_hash(&q, amount_msat, signature, mint_pubkey) {
-        return Some(CertifiedOver::LegacyOutputKey);
-    }
-    bearer_hash
-        .filter(|h| {
-            verify_legacy_note_signature_hash(&hex::encode(h), amount_msat, signature, mint_pubkey)
-        })
-        .map(|_| CertifiedOver::LegacyHash)
+    let digest = note_signature_digest_for_hash(id, domain, amount_msat, cs1.t)?;
+    recovers_to(digest, &cs1.signature, mint_pubkey_hex).then_some(cs1.t)
 }
 
 /// Check a certificate for a note named without its spend, at `domain`: a
 /// `cp1`, or a bearer note's 64-hex `h` (the two things that go where a
-/// `cp1` goes). Tries `hex(Q)` at the domain first, then the legacy messages:
-/// `hex(Q)` without one and, for a bearer `h`, the pre-taproot message over
-/// `h` itself. What a watcher, or a device that discloses only `h`, checks a
-/// note by. `None` if none verifies.
+/// `cp1` goes). What a watcher, or a device that discloses only `h`, checks a
+/// note by. Returns the time it was signed at, `t`, or `None`.
 pub fn check_note_certificate(
     reference: &str,
     domain: &str,
     amount_msat: u64,
     signature: &str,
     mint_pubkey: &str,
-) -> Option<CertifiedOver> {
+) -> Option<u32> {
     let output_key = decode_note(reference)?;
-    let bearer_hash = crate::secrets::is_preimage(reference)
-        .then(|| hex::decode(reference.trim()).ok()?.try_into().ok())
-        .flatten();
-    certified_over(
-        &output_key,
-        bearer_hash,
+    verify_note_signature_hash(
+        &hex::encode(output_key),
         domain,
         amount_msat,
         signature,
@@ -405,8 +281,9 @@ pub struct NoteCheck {
     pub output_key: [u8; 32],
     /// Whether the spend opens `Q` at the note's domain.
     pub spend: SpendVerdict,
-    /// Which message the certificate verified over.
-    pub certificate: CertifiedOver,
+    /// When the certificate was signed, Unix seconds. It attests the note
+    /// was outstanding then, not that it still is: weigh its age.
+    pub signed_at: u32,
 }
 
 impl NoteCheck {
@@ -420,7 +297,8 @@ impl NoteCheck {
 /// LUD-25's offline verification of a certified note: derive `Q` from the
 /// spend, check the spend opens `Q` at `domain` (the note URL's own host, as
 /// a note URL, a mint URL or a bare host), and check the certificate over
-/// `domain`, `Q` and `amount_msat` recovers to `mint_pubkey`.
+/// `domain`, `Q`, `amount_msat` and its `t` recovers to `mint_pubkey`. The
+/// age of `t` is the caller's to weigh against its own policy.
 ///
 /// `None` when `k1` is no spend or the certificate does not verify.
 /// Otherwise [`NoteCheck::spend`] says what the spend did: a `ck1` signed for
@@ -429,8 +307,8 @@ impl NoteCheck {
 /// tell a forged spend from a forged certificate. Time claims are left to
 /// the SERVICE's clock.
 ///
-/// A certificate proves issuance, not that the note is still outstanding:
-/// the previous holder still knows the spend. Rotate on receipt.
+/// A certificate proves the note was outstanding at `t`, not that it still
+/// is: the previous holder still knows the spend. Rotate on receipt.
 pub fn check_note(
     k1: &str,
     domain: &str,
@@ -439,10 +317,8 @@ pub fn check_note(
     mint_pubkey: &str,
 ) -> Option<NoteCheck> {
     let spend = check_spend(k1, domain)?;
-    let bearer_hash = decode_spend(k1)?.bearer_hash();
-    let certificate = certified_over(
-        &spend.output_key,
-        bearer_hash,
+    let signed_at = verify_note_signature_hash(
+        &hex::encode(spend.output_key),
         domain,
         amount_msat,
         signature,
@@ -451,13 +327,13 @@ pub fn check_note(
     Some(NoteCheck {
         output_key: spend.output_key,
         spend: spend.verdict,
-        certificate,
+        signed_at,
     })
 }
 
-/// [`check_note`] as a yes or no: the certificate verifies, over either
-/// message, and the spend opens the note, under any scheme a mint accepts.
-/// A `cw1` whose script this crate does not evaluate is a no.
+/// [`check_note`] as a yes or no: the certificate verifies and the spend
+/// opens the note, under any scheme a mint accepts. A `cw1` whose script
+/// this crate does not evaluate is a no.
 ///
 /// `domain` is required because a `ck1` means nothing without it: the
 /// certificate alone is public, and anyone could pair it with a signature

@@ -19,31 +19,32 @@ use crate::urls::is_allowed_service_url;
 /// What this crate insists a SERVICE does, rather than merely hopes it does.
 ///
 /// LUD-25 has a SERVICE certify every note it issues with a `cs1` over
-/// `hex(Q)`, as a SHOULD, and one running without a signer omits them. A
-/// `cp1` output is owed its certificate whatever this says - see
-/// [`parse_mutation`] - while a bearer output named by its hash is owed one
-/// only when [`Policy::require_signatures`] asks.
+/// `hex(Q)`, a bearer note included (a MUST since luds `fd80cdd`). A `cp1`
+/// output is owed its certificate whatever this says - see
+/// [`parse_mutation`] - and a bearer output named by its hash is too, unless
+/// [`Policy::require_signatures`] is turned off for a mint that has none.
 ///
 /// Build one from the default and change only what you mean to:
 /// `Policy { require_mint_pubkey: false, ..Policy::default() }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     /// Demand a certificate for a bearer output named by its hash, as well as
-    /// for a `cp1` one. Off by default to admit a mint running without a
-    /// signer. With it on, an uncertified bearer output is
+    /// for a `cp1` one. On by default, as LUD-25 requires; off admits a mint
+    /// running without a signer. An uncertified output it demands is
     /// [`Error::Unverifiable`], carrying the fresh secrets.
     pub require_signatures: bool,
     /// Refuse a `withdrawRequest` that publishes no `mintPubkey`, or one that
     /// is not a 33-byte compressed key: the key every certificate verifies
-    /// against. On by default. Turn it off only for a mint that publishes
-    /// none, knowing that nothing it issues can then be checked offline.
+    /// against. On by default, as LUD-25 has a WALLET do. Turn it off only
+    /// for a mint that publishes none, knowing that nothing it issues can
+    /// then be checked offline.
     pub require_mint_pubkey: bool,
 }
 
 impl Default for Policy {
     fn default() -> Self {
         Policy {
-            require_signatures: false,
+            require_signatures: true,
             require_mint_pubkey: true,
         }
     }
@@ -120,9 +121,11 @@ pub struct NoteInfoByHash {
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
     pub mint_pubkey: Option<String>,
+    /// LUD-19 `payLink` to the mint payRequest, which marks the link a note.
+    pub pay_link: String,
     /// `c`: the SERVICE's `cs1` for the queried note, as sent and
     /// unverified. Check it with [`crate::check_note_certificate`] against
-    /// what was looked up.
+    /// what was looked up. Absent for a note worth 0, burned or mid-melt.
     pub signature: Option<String>,
 }
 
@@ -137,10 +140,21 @@ pub struct WithdrawRequestInfo {
     /// ever `None` when the caller set [`Policy::require_mint_pubkey`] to
     /// false.
     pub mint_pubkey: Option<String>,
+    /// LUD-19 `payLink` to the mint payRequest, which marks the link a note.
+    pub pay_link: String,
     /// `c`: the SERVICE's `cs1` for the queried note, as sent and
     /// unverified. Check it with [`crate::check_note`] against the spend and
-    /// `max_withdrawable`.
+    /// `max_withdrawable`. Absent for a note worth 0, burned or mid-melt.
     pub signature: Option<String>,
+}
+
+impl WithdrawRequestInfo {
+    /// A note worth 0: burned, or with a melt in flight (luds `fd80cdd`
+    /// answers both so at the informational GET). Nothing to withdraw now;
+    /// only a melt's `verify` tells the two apart.
+    pub fn is_empty(&self) -> bool {
+        self.max_withdrawable == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,10 +206,9 @@ pub struct PayRequestInfo {
     /// `lnurlw://` spelling - the draft says "as described in LUD-17", and
     /// LUD-17 describes both, so a WALLET accepts either unchanged.
     pub withdraw_link: Option<String>,
-    /// Rarely present here: a WALLET that pays the invoice recovers the
-    /// SERVICE's node id from the invoice's own signature, so the draft only
-    /// has a SERVICE publish this where there is no invoice to recover it
-    /// from. Nothing forbids including it anyway.
+    /// The key every certificate this mint issues verifies against. Always
+    /// present on a minting payRequest (one with a `withdraw_link`): LUD-25
+    /// requires it there since luds `fd80cdd`.
     pub mint_pubkey: Option<String>,
     /// Absent means the SERVICE advertised no fee, which the draft says to
     /// read as fee-free rather than as unknown.
@@ -247,8 +260,11 @@ pub struct MutationResponse {
     pub signature: Option<String>,
     /// `c2`, the same for a split's change.
     pub change_signature: Option<String>,
-    /// LUD-25 melt proof (optional), present only on a melt.
+    /// An echoed `pr` on a melt, which some SERVICEs send. Ignored by LUD-25.
     pub pr: Option<String>,
+    /// LUD-21 `verify` on a melt, which LUD-25 requires since luds
+    /// `fd80cdd`: follow it with [`parse_melt_verify`] rather than repeating
+    /// the spend. `None` from a non-conforming SERVICE; the melt still landed.
     pub verify: Option<String>,
 }
 
@@ -387,6 +403,7 @@ pub fn parse_note_info(
     // IS a withdrawRequest, it just describes a note nobody can check offline.
     // Saying "not a withdrawRequest" would send a caller after the wrong fault.
     check_mint_pubkey(mint_pubkey.as_deref(), policy)?;
+    let pay_link = pay_link_of(body)?;
     Ok(WithdrawRequestInfo {
         callback,
         k1: k1.to_ascii_lowercase(),
@@ -394,8 +411,22 @@ pub fn parse_note_info(
         min_withdrawable,
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
-        signature: certificate(body, "c", "sig"),
+        pay_link,
+        signature: certificate(body, "c"),
     })
+}
+
+/// LUD-19 `payLink`, which LUD-25 requires on a note's `withdrawRequest`
+/// (luds `fd80cdd`): it is what tells a WALLET the link is a note, not a
+/// one-shot voucher.
+fn pay_link_of(body: &Value) -> Result<String> {
+    as_str(body, "payLink")
+        .filter(|link| is_allowed_service_url(link))
+        .ok_or_else(|| {
+            Error::Protocol(
+                "this withdrawRequest carries no payLink, so it is not an LNURLcash note (LUD-25 requires one)".into(),
+            )
+        })
 }
 
 /// The `mintPubkey` check both informational GETs make, when
@@ -464,13 +495,15 @@ pub fn parse_note_info_by_hash(body: &Value, policy: Policy) -> Result<NoteInfoB
     }
     let mint_pubkey = as_str(body, "mintPubkey");
     check_mint_pubkey(mint_pubkey.as_deref(), policy)?;
+    let pay_link = pay_link_of(body)?;
     Ok(NoteInfoByHash {
         callback,
         max_withdrawable,
         min_withdrawable,
         default_description: as_str(body, "defaultDescription"),
         mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
-        signature: certificate(body, "c", "sig"),
+        pay_link,
+        signature: certificate(body, "c"),
     })
 }
 
@@ -662,6 +695,13 @@ pub fn split_request_with_hash(
     h: &str,
     h2: &str,
 ) -> Result<Request> {
+    // LUD-25: a split amount is whole satoshis (luds fd80cdd), so a note
+    // worth a fraction of one, which no payment could ever melt, never exists
+    if amount_msat == 0 || amount_msat % 1000 != 0 {
+        return Err(Error::RequestRefused(
+            "a split amount must be a whole number of satoshis".into(),
+        ));
+    }
     let mut params: Vec<(&str, String)> = k1s.iter().map(|k1| ("k1", k1.clone())).collect();
     params.push(("amount", amount_msat.to_string()));
     params.push(output_param("p1", h)?);
@@ -716,13 +756,9 @@ pub fn merge_request(callback: &str, k1s: &[String], new_secret: &str) -> Result
     Ok(request)
 }
 
-/// A certificate field, by its current name, else the legacy one that LUD-25
-/// used before 50d740a (`sig`, `sig2`). Read only: nothing here writes the
-/// legacy names.
-fn certificate(body: &Value, current: &str, legacy: &str) -> Option<String> {
-    as_str(body, current)
-        .filter(|s| !s.is_empty())
-        .or_else(|| as_str(body, legacy).filter(|s| !s.is_empty()))
+/// A certificate field, `c` or `c2`, when it is a non-empty string.
+fn certificate(body: &Value, key: &str) -> Option<String> {
+    as_str(body, key).filter(|s| !s.is_empty())
 }
 
 /// Classify a mutating callback's response.
@@ -738,14 +774,13 @@ fn certificate(body: &Value, current: &str, legacy: &str) -> Option<String> {
 ///   without it is [`Error::Unverifiable`]: the note exists at the key the
 ///   WALLET disclosed, but nobody can check it offline, which is the whole
 ///   reason to name a note by its key.
-/// - A bearer output named by its hash is certified over its `Q` by a mint
-///   with a signer. [`Policy::require_signatures`] decides whether a
-///   no-signer mint's omission is accepted.
+/// - A bearer output named by its hash is owed one too (luds `fd80cdd`),
+///   unless [`Policy::require_signatures`] is turned off to admit a mint
+///   with no signer.
 ///
 /// A signature that is present is returned as sent and unverified, for either
 /// kind: [`crate::check_note`] and [`crate::check_note_certificate`] check
-/// one, including a pre-taproot certificate over a bearer note's hash. An
-/// output missing from `outputs` is read as a hash.
+/// one. An output missing from `outputs` is read as a hash.
 pub fn parse_mutation(
     body: &Value,
     kind: MutationKind,
@@ -760,8 +795,8 @@ pub fn parse_mutation(
             "the service did not confirm the operation - it may still have been applied",
         ));
     }
-    let signature = certificate(body, "c", "sig");
-    let change_signature = certificate(body, "c2", "sig2");
+    let signature = certificate(body, "c");
+    let change_signature = certificate(body, "c2");
     // The mutation has already landed by the time this is checked - `status`
     // was OK - so the caller of this function must attach the fresh secrets
     // to the error, or enforcing the spec becomes the thing that loses the
@@ -840,6 +875,12 @@ pub fn parse_pay_request(body: &Value) -> Result<PayRequestInfo> {
             "this mint offers no room for the required output commitment - it cannot mint".into(),
         ));
     }
+    // luds fd80cdd: the mint payRequest MUST carry mintPubkey, so a WALLET
+    // knows the key before it pays and can check what it mints
+    let mint_pubkey = as_str(body, "mintPubkey");
+    if withdraw_link.is_some() {
+        check_mint_pubkey(mint_pubkey.as_deref(), Policy::default())?;
+    }
     Ok(PayRequestInfo {
         callback: as_str(body, "callback").ok_or_else(invalid)?,
         min_sendable: as_u64(body, "minSendable").unwrap_or(0),
@@ -847,7 +888,7 @@ pub fn parse_pay_request(body: &Value) -> Result<PayRequestInfo> {
         mint_fee: parse_mint_fee(&metadata),
         metadata,
         withdraw_link,
-        mint_pubkey: as_str(body, "mintPubkey"),
+        mint_pubkey: mint_pubkey.map(|key| key.trim().to_ascii_lowercase()),
         comment_allowed,
         mint_to_hash: body.get("mintToHash").and_then(|v| v.as_bool()) == Some(true),
     })
@@ -992,6 +1033,51 @@ pub fn parse_verify(body: &Value) -> Result<VerifyResult> {
     })
 }
 
+/// Where a melt stands, read off the LUD-21 `verify` its `OK` carried
+/// (luds `fd80cdd`). The informational GET answers 0 for a note in flight
+/// and for a burned one alike; this is what tells them apart, without
+/// putting the spend on the wire again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeltState {
+    /// The payment is in flight; the note is pending. Poll again.
+    InFlight,
+    /// The payment settled and the note is burned. The preimage is the
+    /// receipt: it hashes to the invoice's payment hash.
+    Settled { preimage: Option<String> },
+    /// The payment failed and the note is outstanding again, worth what it
+    /// was: LUD-21's `Not found`, which a melt's `verify` answers once the
+    /// note is restored.
+    Failed,
+}
+
+/// Read a melt's `verify` answer. `Not found` is [`MeltState::Failed`]: for a
+/// URL the SERVICE handed out for a melt, nothing else answers it.
+pub fn parse_melt_verify(body: &Value) -> Result<MeltState> {
+    if body.get("status").and_then(|v| v.as_str()) == Some("ERROR") {
+        let reason = body
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        return if reason
+            .trim()
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case("not found")
+        {
+            Ok(MeltState::Failed)
+        } else {
+            Err(Error::ServiceRejected(reason.to_string()))
+        };
+    }
+    let result = parse_verify(body)?;
+    Ok(if result.settled {
+        MeltState::Settled {
+            preimage: result.preimage,
+        }
+    } else {
+        MeltState::InFlight
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,6 +1117,22 @@ mod tests {
                 "{link}"
             );
             assert!(request.new_secrets.is_empty() && request.outputs.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_split_amount_is_whole_satoshis() {
+        let k1s = vec![PREIMAGE.to_string()];
+        let (h, h2) = ("11".repeat(32), "22".repeat(32));
+        assert!(split_request_with_hash("https://mint.example/w/cb", &k1s, 4000, &h, &h2).is_ok());
+        for amount in [0, 4500, 999] {
+            assert!(
+                matches!(
+                    split_request_with_hash("https://mint.example/w/cb", &k1s, amount, &h, &h2),
+                    Err(Error::RequestRefused(_))
+                ),
+                "{amount}"
+            );
         }
     }
 
@@ -1094,32 +1196,36 @@ mod tests {
         assert_eq!(
             Policy::default(),
             Policy {
-                require_signatures: false,
+                require_signatures: true,
                 require_mint_pubkey: true,
             }
         );
     }
 
     #[test]
-    fn the_default_tolerates_a_no_signer_legacy_output() {
+    fn a_no_signer_output_is_tolerated_only_by_opting_out() {
         let ok = json!({"status": "OK"});
         let one = vec![plain(2)];
         let two = vec![plain(2), plain(3)];
+        let tolerant = Policy {
+            require_signatures: false,
+            ..Policy::default()
+        };
         for (kind, outputs) in [
             (MutationKind::Rotate, &one),
             (MutationKind::Merge, &one),
             (MutationKind::Split, &two),
         ] {
-            let response = parse_mutation(&ok, kind, outputs, Policy::default())
+            let response = parse_mutation(&ok, kind, outputs, tolerant)
                 .unwrap_or_else(|err| panic!("{kind:?}: {err}"));
             assert_eq!(response.signature, None, "{kind:?}");
             assert_eq!(response.change_signature, None, "{kind:?}");
         }
         // an output this was never told about is read as a hash
-        assert!(parse_mutation(&ok, MutationKind::Rotate, &[], Policy::default()).is_ok());
+        assert!(parse_mutation(&ok, MutationKind::Rotate, &[], tolerant).is_ok());
         // a signature a mint issues for a bearer output comes back as sent
         let signed = parse_mutation(
-            &json!({"status": "OK", "sig": "ab".repeat(65)}),
+            &json!({"status": "OK", "c": "ab".repeat(65)}),
             MutationKind::Rotate,
             &one,
             Policy::default(),
@@ -1152,15 +1258,12 @@ mod tests {
         // signed throughout, it is fine
         let both = json!({"status": "OK", "c": "ab".repeat(65), "c2": "cd".repeat(65)});
         assert!(parse_mutation(&both, MutationKind::Split, &two, strict()).is_ok());
-        // a SERVICE still on the pre-50d740a names is read, never written
+        // the pre-50d740a names sig and sig2 are no certificate at all
         let legacy = json!({"status": "OK", "sig": "ab".repeat(65), "sig2": "cd".repeat(65)});
-        let read = parse_mutation(&legacy, MutationKind::Split, &two, strict()).unwrap();
-        assert_eq!(read.signature, Some("ab".repeat(65)));
-        assert_eq!(read.change_signature, Some("cd".repeat(65)));
-        // and the current name wins when both are present
-        let mixed = json!({"status": "OK", "c": "ab".repeat(65), "sig": "ef".repeat(65)});
-        let read = parse_mutation(&mixed, MutationKind::Rotate, &one, strict()).unwrap();
-        assert_eq!(read.signature, Some("ab".repeat(65)));
+        assert!(matches!(
+            parse_mutation(&legacy, MutationKind::Split, &two, strict()),
+            Err(Error::Unverifiable { .. })
+        ));
         // and a melt mints nothing, so it owes nothing under any policy
         assert!(parse_mutation(&ok, MutationKind::Melt, &[], strict()).is_ok());
     }
@@ -1172,6 +1275,7 @@ mod tests {
             "k1": k1,
             "minWithdrawable": 1000u64,
             "maxWithdrawable": 21_000u64,
+            "payLink": "https://mint.example/.well-known/lnurlp/mint",
         });
         if let Some(key) = mint_pubkey {
             body["mintPubkey"] = json!(key);
@@ -1188,15 +1292,15 @@ mod tests {
             require_mint_pubkey: false,
             ..Policy::default()
         };
-        // signatures demanded, the key not: the two no longer ride together
+        // signatures not demanded, the key not either
         let signatures_only = Policy {
-            require_signatures: true,
+            require_signatures: false,
             require_mint_pubkey: false,
         };
 
         for missing in [None, Some("not a key")] {
             let body = withdraw_request(&k1, missing);
-            // refused by default, even though signatures are off by default
+            // refused by default, whatever is asked of signatures
             for policy in [Policy::default(), strict()] {
                 assert!(
                     matches!(

@@ -44,7 +44,7 @@ fn part2_note(fill: u8) -> Part2Note {
         pubkey: hex::encode(pubkey),
         cp1: encode_cp1(&pubkey),
         ck1: encode_ck1(&signature),
-        cs1_shaped: encode_cs1_with_amount(21_000, &[0x33; 65]),
+        cs1_shaped: encode_cs1_with_amount(21_000, &[0x33; 65], 1_800_000_000),
     }
 }
 
@@ -124,14 +124,20 @@ fn nothing_else_has_a_note_id() {
 fn the_signed_message_names_the_key_for_a_ck1() {
     let a = part2_note(0x11);
     assert_eq!(
-        note_signature_message(&a.ck1, "mint.example", 21_000),
-        Some(format!("LNURLcash:mint.example:21000:{}", a.pubkey))
+        note_signature_message(&a.ck1, "mint.example", 21_000, 1_800_000_000),
+        Some(format!(
+            "LNURLcash:mint.example:21000:{}:1800000000",
+            a.pubkey
+        ))
     );
     assert_eq!(
-        note_signature_message("not a k1", "mint.example", 21_000),
+        note_signature_message("not a k1", "mint.example", 21_000, 1_800_000_000),
         None
     );
-    assert_eq!(note_signature_message(&a.ck1, "", 21_000), None);
+    assert_eq!(
+        note_signature_message(&a.ck1, "", 21_000, 1_800_000_000),
+        None
+    );
 }
 
 // ---- note URLs and lookups ----
@@ -215,6 +221,7 @@ fn an_echoed_ck1_must_be_the_same_valid_bearer() {
                 "minWithdrawable": 21_000,
                 "maxWithdrawable": 21_000,
                 "mintPubkey": vectors["mint"]["mintPubkey"],
+                "payLink": "https://mint.example/.well-known/lnurlp/mint",
             }),
             &url,
             Policy::default(),
@@ -255,6 +262,7 @@ fn an_echoed_spend_of_the_same_bearer_note_is_the_same_note() {
             "k1": echoed,
             "maxWithdrawable": 21_000,
             "mintPubkey": format!("02{}", "aa".repeat(32)),
+            "payLink": "https://mint.example/.well-known/lnurlp/mint",
             "c": "cs1-as-sent",
         })
     };
@@ -409,9 +417,13 @@ fn an_uncertified_cp1_output_is_unverifiable_whatever_the_policy() {
         require_signatures: true,
         ..Policy::default()
     };
-    // the default has signatures off, which is the case that matters
-    assert!(!Policy::default().require_signatures);
-    for policy in [Policy::default(), strict] {
+    // a cp1 is owed its certificate even by a caller tolerating a no-signer
+    // mint, which is the case that matters
+    let tolerant = Policy {
+        require_signatures: false,
+        ..Policy::default()
+    };
+    for policy in [tolerant, strict] {
         let cases = [
             (
                 rotate_request_with_hash(CB, &a.ck1, &b.cp1),
@@ -478,20 +490,38 @@ fn a_cp1_change_is_owed_its_certificate_in_c2() {
             &body,
             MutationKind::Split,
             &request.outputs,
-            Policy::default(),
+            Policy {
+                require_signatures: false,
+                ..Policy::default()
+            },
         )
         .expect_err("a cp1 change is owed its certificate");
         assert!(matches!(err, Error::Unverifiable { .. }), "{body}: {err:?}");
         assert!(err.to_string().contains("split's change"), "{body}: {err}");
     }
 
+    // a no-signer mint, tolerated: the change is certified and the bearer
+    // note is excused; by default the bearer note is owed one too
+    let tolerant = Policy {
+        require_signatures: false,
+        ..Policy::default()
+    };
+    assert!(matches!(
+        parse_mutation(
+            &json!({"status": "OK", "c2": b.cs1_shaped}),
+            MutationKind::Split,
+            &request.outputs,
+            Policy::default(),
+        ),
+        Err(Error::Unverifiable { .. })
+    ));
     let response = parse_mutation(
         &json!({"status": "OK", "c2": b.cs1_shaped}),
         MutationKind::Split,
         &request.outputs,
-        Policy::default(),
+        tolerant,
     )
-    .expect("the change is certified and the bearer note owes nothing");
+    .expect("the change is certified and the bearer note is excused");
     assert_eq!(response.signature, None);
     assert_eq!(response.change_signature, Some(b.cs1_shaped));
 }

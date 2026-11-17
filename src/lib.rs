@@ -81,18 +81,16 @@ pub use note::{
     note_signature, resolve_note_input, with_new_k1, without_k1,
 };
 pub use protocol::{
-    InvoiceResult, MintAddressInfo, MutationResponse, PayRequestInfo, Request, VerifyResult,
-    WithdrawRequestInfo, MINT_COMMENT_LENGTH,
+    InvoiceResult, MeltState, MintAddressInfo, MutationResponse, PayRequestInfo, Request,
+    VerifyResult, WithdrawRequestInfo, MINT_COMMENT_LENGTH,
 };
 pub use recoverable::{note_id_of, note_lookup_of};
 pub use secrets::{generate_note_secret, hash_k1, is_preimage};
 pub use signature::{
     address_proof_digest, address_proof_message, check_note, check_note_certificate,
-    legacy_note_signature_digest_for_hash, legacy_note_signature_message_for_hash,
     note_signature_digest, note_signature_digest_for_hash, note_signature_message,
     note_signature_message_for_hash, sign_address_proof, verify_address_proof,
-    verify_legacy_note_signature_hash, verify_note_signature, verify_note_signature_hash,
-    CertifiedOver, NoteCheck,
+    verify_note_signature, verify_note_signature_hash, NoteCheck,
 };
 pub use spend::{
     check_spend, decode_note, decode_spend, spend_domain_of, SpendCheck, SpendVerdict,

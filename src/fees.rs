@@ -54,6 +54,11 @@ fn parse_token(text: &str) -> Option<MintFee> {
     if fee_ppm >= 1_000_000 {
         return None;
     }
+    // base_fee_msat MUST be a multiple of 1000 (luds fd80cdd): a sub-satoshi
+    // base cannot come out of a whole-satoshi credit, so the fee is unknown.
+    if base_fee_msat % 1000 != 0 {
+        return None;
+    }
     let address_fee_msat = parts.next().and_then(value_of);
     Some(MintFee {
         base_fee_msat,
@@ -92,20 +97,24 @@ fn proportional_fee(gross_msat: u64, fee_ppm: u64) -> u64 {
     (gross_msat / 1_000_000) * fee_ppm + ((gross_msat % 1_000_000) * fee_ppm) / 1_000_000
 }
 
-/// What a SERVICE is expected to credit after withholding its advertised fee.
-/// Only ever an estimate to show before paying: the authoritative value is
-/// whatever the informational GET reports once the note is claimed.
+/// What a SERVICE is expected to credit after withholding its advertised fee:
+/// `gross - base - floor(gross * ppm / 1e6)`, rounded down to whole satoshis
+/// (luds fd80cdd). Only ever an estimate to show before paying: the
+/// authoritative value is whatever the informational GET reports once the
+/// note is claimed.
 pub fn apply_mint_fee(gross_msat: u64, fee: MintFee) -> u64 {
-    gross_msat
+    let net = gross_msat
         .saturating_sub(fee.base_fee_msat)
-        .saturating_sub(proportional_fee(gross_msat, fee.fee_ppm))
+        .saturating_sub(proportional_fee(gross_msat, fee.fee_ppm));
+    net / 1000 * 1000
 }
 
-/// The SMALLEST invoice amount whose note nets `net_msat` after the fee.
+/// The SMALLEST invoice amount whose note nets at least `net_msat` after the
+/// fee; exactly `net_msat` when that is whole satoshis.
 ///
-/// [`apply_mint_fee`] is non-decreasing in gross with per-msat steps of 0 or 1
-/// (the proportional term grows by at most 1 per msat, since ppm is below
-/// 1_000_000), so the minimal such gross exists and binary search finds it
+/// [`apply_mint_fee`] is non-decreasing in gross (before rounding it grows by
+/// 0 or 1 per msat, since ppm is below 1_000_000, and rounding down keeps it
+/// monotone), so the minimal such gross exists and binary search finds it
 /// exactly. The tempting alternative - estimate linearly, then walk one msat at
 /// a time - is both unbounded and wrong at the edge: at 999_999 ppm the walk is
 /// roughly a million steps, so any guard on it returns a non-minimal answer,

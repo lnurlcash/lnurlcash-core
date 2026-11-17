@@ -29,6 +29,10 @@ use thiserror::Error;
 /// or burned.
 pub const OUTPUT_IN_USE: &str = "already in use";
 
+/// The reason LUD-25 fixes for a note the SERVICE never credited (luds
+/// `fd80cdd`), at the informational GET and the callback.
+pub const UNKNOWN_NOTE: &str = "unknown note";
+
 #[derive(Debug, Error)]
 pub enum Error {
     /// The request never left: offline, a URL this crate will not fetch, or a
@@ -50,6 +54,14 @@ pub enum Error {
     /// resolves. Retry shortly - never read this as spent.
     #[error("this note has another operation in progress - try again in a moment")]
     NotePending,
+
+    /// The informational GET answered the note worth 0 (luds `fd80cdd`): it
+    /// is burned, or a melt is in flight on it, and the GET does not say
+    /// which. Nothing to withdraw now. A melt this holder made says which
+    /// through its `verify` ([`crate::protocol::parse_melt_verify`]); a
+    /// recovery scan counts the index as used either way.
+    #[error("this note is worth nothing now - it was spent, or a payment from it is in flight")]
+    NoteEmpty,
 
     /// The SERVICE reports the k1 as unambiguously already burned. At the
     /// informational GET that statement is authoritative, so a holder may lock
@@ -212,6 +224,7 @@ impl Error {
             self,
             Error::ServiceRejected(_)
                 | Error::NotePending
+                | Error::NoteEmpty
                 | Error::NoteSpent { .. }
                 | Error::NoteUnknown { .. }
                 | Error::RequestRefused(_)
@@ -225,9 +238,11 @@ impl Error {
 /// possibly multi-k1 request - can only say something like "Invalid or already
 /// spent k1.", since it cannot tell which case applies to which k1.
 ///
-/// LUD-25 fixes one wording (luds `92abbb3`): a burned note is answered exactly
-/// `already in use`, at the informational GET and at the callback alike, and
-/// a LUD-26 recovery scan counts that as a used index. Every caller of this
+/// LUD-25 fixes the wording (luds `fd80cdd`): at the callback a spend of a
+/// burned note is answered exactly `already in use`, and a note the SERVICE
+/// never credited exactly `unknown note`, at the callback and the
+/// informational GET. A burned note no longer errors at the informational
+/// GET: it answers worth 0 (see [`Error::NoteEmpty`]). Every caller of this
 /// is asking about a note being spent, so that exact reason is
 /// [`Error::NoteSpent`]. The same reason also refuses a `p1`/`p2` that is
 /// already somebody's note, and from the wording alone the two are one: a
@@ -242,17 +257,18 @@ impl Error {
 /// though the SERVICE had said it: "Unknown service error" matches the rule for
 /// an unknown note, and would report one on no evidence at all.
 pub fn classify_note_error(reason: &str) -> Error {
-    let lowered = reason.to_ascii_lowercase();
+    let lowered = reason.trim().to_ascii_lowercase();
     if lowered == "pending" {
         return Error::NotePending;
     }
-    if lowered.contains("spent") || lowered.trim() == OUTPUT_IN_USE {
+    // LUD-25's fixed strings first, then the older wordings mints still send
+    if lowered == OUTPUT_IN_USE || lowered.contains("spent") {
         return Error::NoteSpent {
             reason: reason.to_string(),
             new_secrets: Vec::new(),
         };
     }
-    if lowered.contains("unknown") || lowered.contains("not found") {
+    if lowered == UNKNOWN_NOTE || lowered.contains("unknown") || lowered.contains("not found") {
         return Error::NoteUnknown {
             reason: reason.to_string(),
             new_secrets: Vec::new(),

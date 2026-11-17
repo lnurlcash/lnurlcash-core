@@ -212,12 +212,14 @@ pub fn is_cw1(value: &str) -> bool {
     decode_cw1(value).is_some()
 }
 
-/// A decoded current `cs1`: the amount committed in its human-readable part
-/// and the mint's raw 65-byte recoverable signature.
+/// A decoded `cs1`: the amount committed in its human-readable part, the
+/// mint's 65-byte recoverable signature `r || s || recovery-id`, and `t`,
+/// the Unix time it was signed at (luds `fd80cdd`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cs1 {
     pub amount_msat: u64,
     pub signature: [u8; 65],
+    pub t: u32,
 }
 
 fn encode_amount_suffix(amount_msat: u64) -> String {
@@ -260,61 +262,43 @@ fn decode_amount_suffix(value: &str) -> Option<u64> {
     amount.try_into().ok()
 }
 
-/// Legacy fixed-HRP certificate, retained for compatibility with notes made
-/// before the amount moved into `cs1`. New code should use
-/// [`encode_cs1_with_amount`].
-pub fn encode_cs1(signature: &[u8; 65]) -> String {
-    encode_bytes("cs", signature)
-}
-
-pub fn decode_cs1(value: &str) -> Option<[u8; 65]> {
-    decode_fixed("cs", value)
-}
-
-pub fn is_cs1(value: &str) -> bool {
-    decode_cs1(value).is_some()
-}
-
-/// A SERVICE's current issuance certificate. The HRP is `cs` followed by
-/// the signed amount using BOLT-11's amount suffix rules; the payload is the
-/// mint's 65-byte recoverable signature over that amount and the note key.
-pub fn encode_cs1_with_amount(amount_msat: u64, signature: &[u8; 65]) -> String {
+/// A SERVICE's issuance certificate. The HRP is `cs` followed by the signed
+/// amount using BOLT-11's amount suffix rules; the payload is the mint's
+/// 65-byte recoverable signature over that amount, the note key and `t`,
+/// followed by `t` itself, big-endian: 69 bytes.
+pub fn encode_cs1_with_amount(amount_msat: u64, signature: &[u8; 65], t: u32) -> String {
+    let mut payload = [0u8; 69];
+    payload[..65].copy_from_slice(signature);
+    payload[65..].copy_from_slice(&t.to_be_bytes());
     encode_bytes(
         &format!("cs{}", encode_amount_suffix(amount_msat)),
-        signature,
+        &payload,
     )
 }
 
-/// `None` unless the payload is 65 bytes, `r || s || recovery-id`, with the
-/// recovery id 0 to 3, as LUD-25 has a SERVICE refuse anything else.
+/// `None` unless the payload is 69 bytes, `r || s || recovery-id || u32 t`,
+/// with the recovery id 0 to 3, as LUD-25 has a SERVICE refuse anything
+/// else. The 65-byte certificates from before luds `fd80cdd` are refused.
 pub fn decode_cs1_with_amount(value: &str) -> Option<Cs1> {
     let trimmed = value.trim();
     let separator = trimmed.rfind('1')?;
     let hrp = trimmed[..separator].to_ascii_lowercase();
     let amount_msat = decode_amount_suffix(hrp.strip_prefix("cs")?)?;
-    let signature: [u8; 65] = decode_fixed(&hrp, trimmed)?;
-    if signature[64] > 3 {
+    let payload: [u8; 69] = decode_fixed(&hrp, trimmed)?;
+    if payload[64] > 3 {
         return None;
     }
+    let mut signature = [0u8; 65];
+    signature.copy_from_slice(&payload[..65]);
     Some(Cs1 {
         amount_msat,
         signature,
+        t: u32::from_be_bytes(payload[65..].try_into().ok()?),
     })
 }
 
 pub fn is_cs1_with_amount(value: &str) -> bool {
     decode_cs1_with_amount(value).is_some()
-}
-
-/// The raw signature from either current or legacy `cs1` form.
-pub fn decode_any_cs1(value: &str) -> Option<[u8; 65]> {
-    decode_cs1_with_amount(value)
-        .map(|cs1| cs1.signature)
-        .or_else(|| decode_cs1(value))
-}
-
-pub fn is_any_cs1(value: &str) -> bool {
-    decode_any_cs1(value).is_some()
 }
 
 /// A share's extended public key (LUD-26): its chain code and compressed
@@ -855,7 +839,7 @@ mod tests {
             ("cs", {
                 let mut signature = [0x33; 65];
                 signature[64] = 1;
-                encode_cs1_with_amount(21_000, &signature)
+                encode_cs1_with_amount(21_000, &signature, 1_800_000_000)
             }),
             (
                 "cx",
@@ -913,10 +897,10 @@ mod tests {
     #[test]
     fn non_zero_padding_is_refused() {
         // Every payload here leaves spare bits in the last five-bit group,
-        // which must be zero, except the 65-byte cs1 and cx1, which fill
-        // their groups exactly.
+        // which must be zero, except the 65-byte cx1, which fills its
+        // groups exactly.
         for (hrp, value) in samples() {
-            if hrp == "cs" || hrp == "cx" {
+            if hrp == "cx" {
                 continue;
             }
             let (prefix, mut words) = words_of(&value);

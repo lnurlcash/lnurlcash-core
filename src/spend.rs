@@ -258,8 +258,8 @@ pub fn bearer_cw1(preimage: &[u8]) -> Option<Cw1> {
 
 // ---- what a signature signs ----
 
-/// The domain a spend at `value` is bound to: the lowercase hostname, never
-/// the scheme or the port. `value` may be a note or mint URL (https, http, a
+/// The domain a spend at `value` is bound to: the host lowercased, A-label,
+/// without port, userinfo or trailing dot. `value` may be a note or mint URL (https, http, a
 /// LUD-17 scheme or a bech32 LNURL) or a bare host, with or without a port.
 /// `None` when it names no host.
 ///
@@ -278,10 +278,14 @@ pub fn spend_domain_of(value: &str) -> Option<String> {
     } else {
         format!("https://{expanded}")
     };
+    // The host, lowercased, in A-label form, without port, userinfo or
+    // trailing dot (luds fd80cdd): the url crate does the IDNA step and
+    // drops port and userinfo.
     let host = url::Url::parse(&candidate)
         .ok()?
         .host_str()?
         .to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
     (!host.is_empty()).then_some(host)
 }
 
