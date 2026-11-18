@@ -25,19 +25,24 @@ protocol::melt_request(callback, k1, bolt11) -> Request
 protocol::parse_mutation(&Value, MutationKind, &request.outputs, Policy)
   -> MutationResponse. outputs = what the rotate/split/merge named, recorded
   on the Request: [output], or [output, change] for a split. A cp1 output is
-  owed its cs1 in c (c2 for a split's change; legacy sig/sig2 still read) ALWAYS, whatever the
-  policy; without it the mutation is Unverifiable. A bearer output named by
-  its hash is certified by a mint with a signer; the tolerant default admits
-  None from one without. A missing output reads as a hash. Signatures come
-  back as sent, unverified. MutationKind::{Melt,Rotate,Split,Merge} - a melt
-  mints nothing and owes none.
-protocol::Policy { require_signatures, require_mint_pubkey }  defaults false
-  and true. require_signatures demands a cs1 for a bearer output too.
+  owed its cs1 in c (c2 for a split's change) ALWAYS, whatever the policy;
+  without it the mutation is Unverifiable. A bearer output named by its hash
+  is owed one too (luds fd80cdd) unless require_signatures is turned off. A
+  missing output reads as a hash. Signatures come back as sent, unverified.
+  MutationKind::{Melt,Rotate,Split,Merge} - a melt mints nothing and owes
+  none; its MutationResponse.verify is LUD-21 verify, read with
+  parse_melt_verify -> MeltState::{InFlight, Settled{preimage}, Failed}
+  (Failed = "Not found": the payment failed and the note is restored).
+protocol::Policy { require_signatures, require_mint_pubkey }  both default
+  true. require_signatures off admits a mint with no signer.
   require_mint_pubkey refuses a withdrawRequest with no valid mintPubkey.
   Build with ..Policy::default().
 protocol::parse_note_info also returns `signature`: the c LUD-25 has the
-  informational GET return for the queried note, as sent. Same on
-  NoteInfoByHash.
+  informational GET return for the queried note, as sent, and `pay_link`,
+  which it requires. Same on NoteInfoByHash. A burned or mid-melt note
+  answers worth 0 with no c (WithdrawRequestInfo::is_empty); settle_note
+  refuses one with Error::NoteEmpty. An uncredited note is exactly
+  "unknown note" -> Error::NoteUnknown.
 protocol::pay_request_request / invoice_request / verify_request + parse_*
 
 generate_note_secret() -> String    a fresh bearer preimage, 32 bytes hex
@@ -80,23 +85,25 @@ check_leaf(version, script) / check_time_claim(locktime, sequence, now,
 ## Offline verification
 
 check_note(k1, domain, amount_msat, sig, mint_pubkey) -> Option<NoteCheck {
-  output_key, spend: SpendVerdict, certificate: CertifiedOver }>
+  output_key, spend: SpendVerdict, signed_at: u32 }>
   None = no spend, or the certificate does not verify. is_verified() = the
-  spend opens Q at domain (current or legacy) AND the certificate verifies.
+  spend opens Q at domain AND the certificate verifies. signed_at is the
+  certificate's t: weigh its age.
 verify_note_signature(k1, domain, amount_msat, sig, mint_pubkey) -> bool
   = check_note(..).is_verified(). DOMAIN IS REQUIRED: Q and the cs1 are both
   public, so ck1<Q||junk> beside a real cs1 would otherwise pass.
 check_note_url(note_url, mint_pubkey)   the same, read off
-  ...?k1=<spend>&c=<cs1> (legacy &sig= still read) (domain from the URL, amount from cs1 or amount=)
-check_note_certificate(cp1 or bearer h, amount, sig, mint_pubkey) ->
-  Option<CertifiedOver::{OutputKey, LegacyHash}>   LegacyHash = a
-  pre-taproot certificate over h
-verify_note_signature_hash(id, ..) -> bool   raw: over exactly this 64-hex id
-cs1 message: "LNURLcash:" || domain || ":" || amount_msat || ":" || hex(Q),
-  Lightning signmessage digest, r||s||recid, recid 0..3. An amount-bearing
-  cs1 must state the amount it signs in its HRP. Read only, reported as
-  legacy: the message without the domain (CertifiedOver::LegacyOutputKey,
-  either recid end), and over a bearer h (CertifiedOver::LegacyHash).
+  ...?k1=<spend>&c=<cs1> (domain from the URL, amount from cs1 or amount=)
+check_note_certificate(cp1 or bearer h, domain, amount, sig, mint_pubkey) ->
+  Option<u32>   the t it was signed at
+verify_note_signature_hash(id, ..) -> Option<u32>   raw: over exactly this 64-hex id
+cs1 message: "LNURLcash:" || domain || ":" || amount_msat || ":" || hex(Q)
+  || ":" || t, Lightning signmessage digest; payload r||s||recid||u32be(t),
+  69 bytes, recid 0..3. A cs1 must state the amount it signs in its HRP.
+  The 65-byte certificates from before luds fd80cdd are refused.
+note_signature_message_for_hash(id, domain, amount_msat, t)   what a mint
+  hands its node's signmessage, t its clock's now; then
+  encode_cs1_with_amount(amount, &sig, t).
 
 cash::derive_cash_root(seed) -> CashNode        BIP-32 m/139'
 cash::derive_service_root(root, domain) -> S    LUD-26: m/139'/d1/d2/d3/d4,
@@ -135,7 +142,7 @@ encode_cw1/decode_cw1/is_cw1   script-path spend, Cw1 { locktime, sequence,
   big-endian. decode refuses leftovers, a missing script or control block,
   and a control block committing to no key. Cw1::output_key()
 encode_cs1_with_amount/decode_cs1_with_amount   mint certificate, "cs" +
-  BOLT-11 amount; encode_cs1/decode_cs1 the legacy fixed "cs"
+  BOLT-11 amount, Cs1 { amount_msat, signature, t }
 encode_cx1/decode_cx1/is_cx1   a share's xpub, Cx1 { chain_code, pubkey
   (33, compressed) }, "cx", 65 bytes, 113 chars; decode refuses a pubkey that
   is not a compressed point and the old 64-byte shape. Decoders return None,

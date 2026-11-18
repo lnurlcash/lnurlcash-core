@@ -104,6 +104,8 @@ pub enum LnurlcashError {
     ServiceRejected { reason: String },
     /// A melt is in flight on this k1. Retry - never read this as spent.
     NotePending,
+    /// The note is worth 0: burned, or a melt is in flight on it.
+    NoteEmpty,
     /// Authoritative: the note is already burned.
     NoteSpent {
         reason: String,
@@ -141,6 +143,7 @@ impl std::fmt::Display for LnurlcashError {
             | LnurlcashError::NoteSpent { reason, .. }
             | LnurlcashError::NoteUnknown { reason, .. } => write!(f, "{reason}"),
             LnurlcashError::NotePending => write!(f, "pending"),
+            LnurlcashError::NoteEmpty => write!(f, "worth nothing now"),
             LnurlcashError::Ambiguous { detail, .. }
             | LnurlcashError::Unverifiable { detail, .. } => write!(f, "{detail}"),
         }
@@ -156,6 +159,7 @@ impl From<Error> for LnurlcashError {
             Error::Protocol(detail) => LnurlcashError::Protocol { detail },
             Error::ServiceRejected(reason) => LnurlcashError::ServiceRejected { reason },
             Error::NotePending => LnurlcashError::NotePending,
+            Error::NoteEmpty => LnurlcashError::NoteEmpty,
             Error::NoteSpent {
                 reason,
                 new_secrets,
@@ -212,8 +216,11 @@ pub struct FfiWithdrawInfo {
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
     pub mint_pubkey: Option<String>,
+    /// LUD-19 `payLink` to the mint payRequest.
+    pub pay_link: String,
     /// `c`: the service's `cs1` for the queried note, as sent and
-    /// unverified. Check it with [`check_note`].
+    /// unverified. Check it with [`check_note`]. Absent for a note worth 0,
+    /// which is burned or has a melt in flight.
     pub signature: Option<String>,
 }
 
@@ -226,8 +233,11 @@ pub struct FfiNoteInfoByHash {
     pub min_withdrawable: u64,
     pub default_description: Option<String>,
     pub mint_pubkey: Option<String>,
+    /// LUD-19 `payLink` to the mint payRequest.
+    pub pay_link: String,
     /// `c`, as sent and unverified. Check it with
-    /// [`check_note_certificate`] against what was looked up.
+    /// [`check_note_certificate`] against what was looked up. Absent for a
+    /// note worth 0.
     pub signature: Option<String>,
 }
 
@@ -348,27 +358,6 @@ pub fn is_preimage(value: &str) -> bool {
     secrets::is_preimage(value)
 }
 
-/// Which message a certificate verified over.
-#[derive(Debug, Clone, Copy, uniffi::Enum)]
-pub enum FfiCertifiedOver {
-    /// `hex(Q)` at the note's domain, LUD-25's certificate for any note.
-    OutputKey,
-    /// `hex(Q)` without a domain, as a mint signed before luds 92abbb3.
-    LegacyOutputKey,
-    /// A bearer note's hash, as a mint signed before notes were keyed by `Q`.
-    LegacyHash,
-}
-
-impl From<signature::CertifiedOver> for FfiCertifiedOver {
-    fn from(over: signature::CertifiedOver) -> Self {
-        match over {
-            signature::CertifiedOver::OutputKey => FfiCertifiedOver::OutputKey,
-            signature::CertifiedOver::LegacyOutputKey => FfiCertifiedOver::LegacyOutputKey,
-            signature::CertifiedOver::LegacyHash => FfiCertifiedOver::LegacyHash,
-        }
-    }
-}
-
 /// Whether a spend opens its note.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiSpendVerdict {
@@ -407,7 +396,8 @@ pub struct FfiNoteCheck {
     /// The note, `hex(Q)`.
     pub output_key: String,
     pub spend: FfiSpendVerdict,
-    pub certificate: FfiCertifiedOver,
+    /// When the certificate was signed, Unix seconds: weigh its age.
+    pub signed_at: u32,
     /// Certified, and opened by the spend under a scheme mints accept.
     pub verified: bool,
 }
@@ -418,7 +408,7 @@ impl From<signature::NoteCheck> for FfiNoteCheck {
             output_key: hex::encode(check.output_key),
             verified: check.is_verified(),
             spend: check.spend.into(),
-            certificate: check.certificate.into(),
+            signed_at: check.signed_at,
         }
     }
 }
@@ -426,11 +416,9 @@ impl From<signature::NoteCheck> for FfiNoteCheck {
 /// LUD-25's offline verification as a yes or no: the certificate covers the
 /// note `k1` spends at `domain` (the note URL, or its host) and
 /// `amount_msat`, recovering to `mint_pubkey_hex`, and the spend opens the
-/// note there. A certificate over a superseded message still counts; see
-/// [`check_note`] for which one it was.
+/// note there. See [`check_note`] for when it was signed.
 ///
-/// `k1` is a 64-hex preimage, a `ck1` or a `cw1`; `signature` a `cs1` or 65
-/// bytes of hex.
+/// `k1` is a 64-hex preimage, a `ck1` or a `cw1`; `signature` a `cs1`.
 #[uniffi::export]
 pub fn verify_note_signature(
     k1: &str,
@@ -442,7 +430,7 @@ pub fn verify_note_signature(
     signature::verify_note_signature(k1, domain, amount_msat, signature, mint_pubkey_hex)
 }
 
-/// The same check, reporting which certificate message verified and what the
+/// The same check, reporting when the certificate was signed and what the
 /// spend did. Null when `k1` is no spend or the certificate does not verify.
 #[uniffi::export]
 pub fn check_note(
@@ -463,8 +451,8 @@ pub fn check_note_url(url: &str, mint_pubkey_hex: &str) -> Option<FfiNoteCheck> 
 }
 
 /// A certificate for a note named without its spend, at `domain`: a `cp1`,
-/// or a bearer note's 64-hex hash. Falls back to the superseded messages,
-/// reported as legacy. Null if none verifies.
+/// or a bearer note's 64-hex hash. The time it was signed at, Unix seconds,
+/// or null if it does not verify.
 #[uniffi::export]
 pub fn check_note_certificate(
     reference: &str,
@@ -472,14 +460,13 @@ pub fn check_note_certificate(
     amount_msat: u64,
     signature: &str,
     mint_pubkey_hex: &str,
-) -> Option<FfiCertifiedOver> {
+) -> Option<u32> {
     signature::check_note_certificate(reference, domain, amount_msat, signature, mint_pubkey_hex)
-        .map(Into::into)
 }
 
-/// The raw current certificate check over exactly the 64-hex `hex(Q)` given,
-/// at `domain`. Prefer [`check_note`] or [`check_note_certificate`], which
-/// work the id out themselves.
+/// The raw certificate check over exactly the 64-hex `hex(Q)` given, at
+/// `domain`: the time it was signed at, or null. Prefer [`check_note`] or
+/// [`check_note_certificate`], which work the id out themselves.
 #[uniffi::export]
 pub fn verify_note_signature_hash(
     id: &str,
@@ -487,15 +474,20 @@ pub fn verify_note_signature_hash(
     amount_msat: u64,
     signature: &str,
     mint_pubkey_hex: &str,
-) -> bool {
+) -> Option<u32> {
     signature::verify_note_signature_hash(id, domain, amount_msat, signature, mint_pubkey_hex)
 }
 
-/// The message a SERVICE certifies for `hex(Q)` at `domain`. Null for a
-/// domain that names none.
+/// The message a SERVICE certifies for `hex(Q)` at `domain`, signed at Unix
+/// time `t`. Null for a domain that names none.
 #[uniffi::export]
-pub fn note_signature_message_for_hash(id: &str, domain: &str, amount_msat: u64) -> Option<String> {
-    signature::note_signature_message_for_hash(id, domain, amount_msat)
+pub fn note_signature_message_for_hash(
+    id: &str,
+    domain: &str,
+    amount_msat: u64,
+    t: u32,
+) -> Option<String> {
+    signature::note_signature_message_for_hash(id, domain, amount_msat, t)
 }
 
 // ---- spends ----
@@ -824,11 +816,12 @@ impl From<recoverable::Cx1> for FfiCx1 {
     }
 }
 
-/// An amount-bearing mint certificate, with its signature bytes as hex.
+/// A mint certificate: its amount, its signature bytes as hex, and `t`.
 #[derive(Debug, uniffi::Record)]
 pub struct FfiCs1 {
     pub amount_msat: u64,
     pub signature: String,
+    pub t: u32,
 }
 
 impl From<recoverable::Cs1> for FfiCs1 {
@@ -836,6 +829,7 @@ impl From<recoverable::Cs1> for FfiCs1 {
         FfiCs1 {
             amount_msat: cs1.amount_msat,
             signature: hex::encode(cs1.signature),
+            t: cs1.t,
         }
     }
 }
@@ -879,32 +873,14 @@ pub fn is_ck1(value: &str) -> bool {
     recoverable::is_ck1(value)
 }
 
-/// A legacy fixed-HRP mint certificate. New code should use
-/// [`encode_cs1_with_amount`].
+/// A mint certificate over a 65-byte `r || s || recovery-id` signature
+/// made at Unix time `t`.
 #[uniffi::export]
-pub fn encode_cs1(signature_hex: &str) -> FfiResult<String> {
-    Ok(recoverable::encode_cs1(&hex_array(
-        signature_hex,
-        "a certificate",
-    )?))
-}
-
-#[uniffi::export]
-pub fn decode_cs1(value: &str) -> Option<String> {
-    recoverable::decode_cs1(value).map(hex::encode)
-}
-
-#[uniffi::export]
-pub fn is_cs1(value: &str) -> bool {
-    recoverable::is_cs1(value)
-}
-
-/// A current amount-bearing mint certificate.
-#[uniffi::export]
-pub fn encode_cs1_with_amount(amount_msat: u64, signature_hex: &str) -> FfiResult<String> {
+pub fn encode_cs1_with_amount(amount_msat: u64, signature_hex: &str, t: u32) -> FfiResult<String> {
     Ok(recoverable::encode_cs1_with_amount(
         amount_msat,
         &hex_array(signature_hex, "a certificate")?,
+        t,
     ))
 }
 
@@ -916,16 +892,6 @@ pub fn decode_cs1_with_amount(value: &str) -> Option<FfiCs1> {
 #[uniffi::export]
 pub fn is_cs1_with_amount(value: &str) -> bool {
     recoverable::is_cs1_with_amount(value)
-}
-
-#[uniffi::export]
-pub fn decode_any_cs1(value: &str) -> Option<String> {
-    recoverable::decode_any_cs1(value).map(hex::encode)
-}
-
-#[uniffi::export]
-pub fn is_any_cs1(value: &str) -> bool {
-    recoverable::is_any_cs1(value)
 }
 
 #[uniffi::export]
@@ -1484,6 +1450,7 @@ pub fn parse_note_info(
         min_withdrawable: info.min_withdrawable,
         default_description: info.default_description,
         mint_pubkey: info.mint_pubkey,
+        pay_link: info.pay_link,
         signature: info.signature,
     })
 }
@@ -1499,6 +1466,7 @@ pub fn parse_note_info_by_hash(body: &str, policy: FfiPolicy) -> FfiResult<FfiNo
         min_withdrawable: info.min_withdrawable,
         default_description: info.default_description,
         mint_pubkey: info.mint_pubkey,
+        pay_link: info.pay_link,
         signature: info.signature,
     })
 }
@@ -1564,6 +1532,28 @@ pub fn parse_verify(body: &str) -> FfiResult<FfiVerify> {
         settled: result.settled,
         preimage: result.preimage,
         pr: result.pr,
+    })
+}
+
+/// Where a melt stands, from its `verify`.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiMeltState {
+    /// In flight: the note is pending. Poll again.
+    InFlight,
+    /// Settled, the note burned; the preimage is the receipt.
+    Settled { preimage: Option<String> },
+    /// Failed, and the note is outstanding again (LUD-21 `Not found`).
+    Failed,
+}
+
+/// Read a melt's `verify` answer: [`FfiMeltState`].
+#[uniffi::export]
+pub fn parse_melt_verify(body: &str) -> FfiResult<FfiMeltState> {
+    let value = parse_body(body)?;
+    Ok(match protocol::parse_melt_verify(&value)? {
+        protocol::MeltState::InFlight => FfiMeltState::InFlight,
+        protocol::MeltState::Settled { preimage } => FfiMeltState::Settled { preimage },
+        protocol::MeltState::Failed => FfiMeltState::Failed,
     })
 }
 
