@@ -178,7 +178,7 @@ pub fn note_signature_message(k1: &str, domain: &str, amount_msat: u64, t: u32) 
 /// The same message over a note id given directly, `hex(Q)`, used exactly
 /// as given, lowercased. `None` for a `domain` that names none. What a
 /// SERVICE hands its node's signmessage, `t` its own clock's now; then
-/// [`crate::encode_cs1_with_amount`] with the same `t`.
+/// [`crate::recoverable::encode_cs1_with_amount`] with the same `t`.
 pub fn note_signature_message_for_hash(
     id: &str,
     domain: &str,
