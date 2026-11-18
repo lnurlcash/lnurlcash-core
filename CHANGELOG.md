@@ -59,6 +59,9 @@ Breaking. Follows LUD-25 as of lnurl/luds `fd80cdd` and grades against
 - The certificate names `sig`/`sig2` are no longer read.
 - `legacy_derivation_vectors` pins two cases of the pre-spec HMAC scheme
   itself, since conformance 0.17.0 dropped `derivation.json`.
+- The stale Kotlin file checked in under `uniffi/` since 0.1.0 is gone.
+  Generate bindings as the README shows, or take them from CI's `bindings`
+  artifact.
 
 ## 0.3.1 - 2026-11-03
 

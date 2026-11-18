@@ -1,4 +1,5 @@
 /target
 /bindings
+/uniffi
 **/*.rs.bk
 .DS_Store
